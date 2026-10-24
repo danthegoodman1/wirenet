@@ -9,6 +9,15 @@ import (
 	"time"
 )
 
+type Admin struct {
+	ID        string
+	Name      string
+	TokenHash []byte
+	Global    bool
+	Networks  []byte
+	Created   time.Time
+}
+
 type Edge struct {
 	Network  string
 	A        string
@@ -27,6 +36,8 @@ type Host struct {
 	Endpoint  string
 	Revision  int64
 	Created   time.Time
+	Global    bool
+	Networks  []byte
 }
 
 type Interface struct {
@@ -65,6 +76,7 @@ type Network struct {
 	Revision int64
 	Created  time.Time
 	Changed  time.Time
+	Quota    []byte
 }
 
 type PortCursor struct {

@@ -475,6 +475,10 @@ type Host struct {
 	journal  string
 	lab      *Lab
 	args     []string
+	// by registers the host, and networks scopes it; a host the operator
+	// registers with no networks is global.
+	by       *cpclient.Client
+	networks []string
 }
 
 // AddHost registers a host and starts its agent. args are extra wirenet-agent
@@ -499,8 +503,28 @@ func (l *Lab) AddGatewayHost(ctx context.Context, name string, args ...string) (
 	return h, l.register(ctx, h)
 }
 
+// AddHostAs registers a host through an admin client, the operator's or an
+// admin token's, scoped to networks, and starts its agent.
+func (l *Lab) AddHostAs(ctx context.Context, by *cpclient.Client, name string, networks []string, args ...string) (*Host, error) {
+	n, err := l.addNode(name)
+	if err != nil {
+		return nil, err
+	}
+	h := &Host{node: n, Name: name, Prefix: l.opts.Name + name + "w", lab: l, args: args, by: by, networks: networks}
+	return h, l.register(ctx, h)
+}
+
+// Client returns a client of the control plane holding a token.
+func (l *Lab) Client(token string) (*cpclient.Client, error) {
+	return cpclient.New(l.CPURL, token, cpclient.Options{})
+}
+
 func (l *Lab) register(ctx context.Context, h *Host) error {
-	creds, err := l.Admin.CreateHost(ctx, api.CreateHost{Name: h.Name, Endpoint: h.endpoint})
+	by := h.by
+	if by == nil {
+		by = l.Admin
+	}
+	creds, err := by.CreateHost(ctx, api.CreateHost{Name: h.Name, Endpoint: h.endpoint, Networks: h.networks})
 	if err != nil {
 		return err
 	}

@@ -10,6 +10,15 @@ import (
 	"time"
 )
 
+const deleteAdmin = `-- name: DeleteAdmin :exec
+DELETE FROM admins WHERE id = $1
+`
+
+func (q *Queries) DeleteAdmin(ctx context.Context, id string) error {
+	_, err := q.db.Exec(ctx, deleteAdmin, id)
+	return err
+}
+
 const deleteHost = `-- name: DeleteHost :exec
 DELETE FROM hosts WHERE id = $1
 `
@@ -28,8 +37,62 @@ func (q *Queries) DeleteRelay(ctx context.Context, id string) error {
 	return err
 }
 
+const getAdmin = `-- name: GetAdmin :one
+SELECT id, name, token_hash, global, networks, created FROM admins WHERE id = $1
+`
+
+func (q *Queries) GetAdmin(ctx context.Context, id string) (Admin, error) {
+	row := q.db.QueryRow(ctx, getAdmin, id)
+	var i Admin
+	err := row.Scan(
+		&i.ID,
+		&i.Name,
+		&i.TokenHash,
+		&i.Global,
+		&i.Networks,
+		&i.Created,
+	)
+	return i, err
+}
+
+const getAdminByName = `-- name: GetAdminByName :one
+SELECT id, name, token_hash, global, networks, created FROM admins WHERE name = $1
+`
+
+func (q *Queries) GetAdminByName(ctx context.Context, name string) (Admin, error) {
+	row := q.db.QueryRow(ctx, getAdminByName, name)
+	var i Admin
+	err := row.Scan(
+		&i.ID,
+		&i.Name,
+		&i.TokenHash,
+		&i.Global,
+		&i.Networks,
+		&i.Created,
+	)
+	return i, err
+}
+
+const getAdminByToken = `-- name: GetAdminByToken :one
+SELECT id, name, token_hash, global, networks, created FROM admins WHERE token_hash = $1 ORDER BY id LIMIT 1
+`
+
+func (q *Queries) GetAdminByToken(ctx context.Context, tokenHash []byte) (Admin, error) {
+	row := q.db.QueryRow(ctx, getAdminByToken, tokenHash)
+	var i Admin
+	err := row.Scan(
+		&i.ID,
+		&i.Name,
+		&i.TokenHash,
+		&i.Global,
+		&i.Networks,
+		&i.Created,
+	)
+	return i, err
+}
+
 const getHost = `-- name: GetHost :one
-SELECT id, name, token_hash, endpoint, revision, created FROM hosts WHERE id = $1
+SELECT id, name, token_hash, endpoint, revision, created, global, networks FROM hosts WHERE id = $1
 `
 
 func (q *Queries) GetHost(ctx context.Context, id string) (Host, error) {
@@ -42,12 +105,14 @@ func (q *Queries) GetHost(ctx context.Context, id string) (Host, error) {
 		&i.Endpoint,
 		&i.Revision,
 		&i.Created,
+		&i.Global,
+		&i.Networks,
 	)
 	return i, err
 }
 
 const getHostByName = `-- name: GetHostByName :one
-SELECT id, name, token_hash, endpoint, revision, created FROM hosts WHERE name = $1
+SELECT id, name, token_hash, endpoint, revision, created, global, networks FROM hosts WHERE name = $1
 `
 
 func (q *Queries) GetHostByName(ctx context.Context, name string) (Host, error) {
@@ -60,12 +125,14 @@ func (q *Queries) GetHostByName(ctx context.Context, name string) (Host, error) 
 		&i.Endpoint,
 		&i.Revision,
 		&i.Created,
+		&i.Global,
+		&i.Networks,
 	)
 	return i, err
 }
 
 const getHostByToken = `-- name: GetHostByToken :one
-SELECT id, name, token_hash, endpoint, revision, created FROM hosts WHERE token_hash = $1 ORDER BY id LIMIT 1
+SELECT id, name, token_hash, endpoint, revision, created, global, networks FROM hosts WHERE token_hash = $1 ORDER BY id LIMIT 1
 `
 
 func (q *Queries) GetHostByToken(ctx context.Context, tokenHash []byte) (Host, error) {
@@ -78,6 +145,8 @@ func (q *Queries) GetHostByToken(ctx context.Context, tokenHash []byte) (Host, e
 		&i.Endpoint,
 		&i.Revision,
 		&i.Created,
+		&i.Global,
+		&i.Networks,
 	)
 	return i, err
 }
@@ -145,6 +214,70 @@ func (q *Queries) GetRelayByToken(ctx context.Context, tokenHash []byte) (Relay,
 	return i, err
 }
 
+const listAdmins = `-- name: ListAdmins :many
+SELECT id, name, token_hash, global, networks, created FROM admins ORDER BY id
+`
+
+func (q *Queries) ListAdmins(ctx context.Context) ([]Admin, error) {
+	rows, err := q.db.Query(ctx, listAdmins)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Admin
+	for rows.Next() {
+		var i Admin
+		if err := rows.Scan(
+			&i.ID,
+			&i.Name,
+			&i.TokenHash,
+			&i.Global,
+			&i.Networks,
+			&i.Created,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listHosts = `-- name: ListHosts :many
+SELECT id, name, token_hash, endpoint, revision, created, global, networks FROM hosts ORDER BY id
+`
+
+func (q *Queries) ListHosts(ctx context.Context) ([]Host, error) {
+	rows, err := q.db.Query(ctx, listHosts)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Host
+	for rows.Next() {
+		var i Host
+		if err := rows.Scan(
+			&i.ID,
+			&i.Name,
+			&i.TokenHash,
+			&i.Endpoint,
+			&i.Revision,
+			&i.Created,
+			&i.Global,
+			&i.Networks,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listRelays = `-- name: ListRelays :many
 SELECT id, name, token_hash, addresses, port_lo, port_hi, probe_port, revision, created FROM relays ORDER BY id
 `
@@ -179,13 +312,47 @@ func (q *Queries) ListRelays(ctx context.Context) ([]Relay, error) {
 	return items, nil
 }
 
-const putHost = `-- name: PutHost :execrows
-INSERT INTO hosts (id, name, token_hash, endpoint, revision, created)
+const putAdmin = `-- name: PutAdmin :execrows
+INSERT INTO admins (id, name, token_hash, global, networks, created)
 SELECT $1, $2, $3, $4, $5, $6
+WHERE NOT EXISTS (SELECT 1 FROM admins AS o WHERE o.name = $2 AND o.id <> $1)
+ON CONFLICT (id) DO UPDATE SET
+	name = excluded.name, token_hash = excluded.token_hash, global = excluded.global,
+	networks = excluded.networks, created = excluded.created
+`
+
+type PutAdminParams struct {
+	ID        string
+	Name      string
+	TokenHash []byte
+	Global    bool
+	Networks  []byte
+	Created   time.Time
+}
+
+func (q *Queries) PutAdmin(ctx context.Context, arg PutAdminParams) (int64, error) {
+	result, err := q.db.Exec(ctx, putAdmin,
+		arg.ID,
+		arg.Name,
+		arg.TokenHash,
+		arg.Global,
+		arg.Networks,
+		arg.Created,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const putHost = `-- name: PutHost :execrows
+INSERT INTO hosts (id, name, token_hash, endpoint, revision, created, global, networks)
+SELECT $1, $2, $3, $4, $5, $6, $7, $8
 WHERE NOT EXISTS (SELECT 1 FROM hosts AS o WHERE o.name = $2 AND o.id <> $1)
 ON CONFLICT (id) DO UPDATE SET
 	name = excluded.name, token_hash = excluded.token_hash, endpoint = excluded.endpoint,
-	revision = excluded.revision, created = excluded.created
+	revision = excluded.revision, created = excluded.created, global = excluded.global,
+	networks = excluded.networks
 `
 
 type PutHostParams struct {
@@ -195,6 +362,8 @@ type PutHostParams struct {
 	Endpoint  string
 	Revision  int64
 	Created   time.Time
+	Global    bool
+	Networks  []byte
 }
 
 func (q *Queries) PutHost(ctx context.Context, arg PutHostParams) (int64, error) {
@@ -205,6 +374,8 @@ func (q *Queries) PutHost(ctx context.Context, arg PutHostParams) (int64, error)
 		arg.Endpoint,
 		arg.Revision,
 		arg.Created,
+		arg.Global,
+		arg.Networks,
 	)
 	if err != nil {
 		return 0, err

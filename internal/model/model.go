@@ -25,6 +25,7 @@ type (
 	HostID      string
 	RelayID     string
 	RuleID      string
+	AdminID     string
 )
 
 // Prefixes of each kind of identifier.
@@ -35,6 +36,7 @@ const (
 	HostPrefix      = "host-"
 	RelayPrefix     = "relay-"
 	RulePrefix      = "rule-"
+	AdminPrefix     = "admin-"
 )
 
 // idChars is 16 lowercase base32 characters, 80 bits.

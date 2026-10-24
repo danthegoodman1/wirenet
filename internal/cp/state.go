@@ -70,8 +70,8 @@ func CompileNetwork(tx store.ReadTx, cache Cache, n store.Network) (Compiled, er
 }
 
 // HostGeneration returns a host's generation: the newest revision among the
-// host's own record and the networks it builds interfaces in. Every change
-// to what the host should run raises one of them.
+// host's own record and the networks its scope admits where it builds
+// interfaces. Every change to what the host should run raises one of them.
 func HostGeneration(tx store.ReadTx, host model.HostID) (uint64, []store.Network, error) {
 	h, err := tx.Host(host)
 	if err != nil {
@@ -83,7 +83,11 @@ func HostGeneration(tx store.ReadTx, host model.HostID) (uint64, []store.Network
 	}
 	var ids []model.NetworkID
 	for _, i := range ifaces {
-		if compile.Built(i) {
+		// A network the host's scope lost keeps its revoked interfaces'
+		// records until they expire, and polling it would show the host
+		// every service address the network gains meanwhile. Its agent
+		// fences a network gone from its poll as it fences a revocation.
+		if compile.Built(i) && h.Scope.Admits(i.Network) {
 			ids = append(ids, i.Network)
 		}
 	}
@@ -128,12 +132,27 @@ func HostState(tx store.ReadTx, cache Cache, host model.HostID, since uint64) (a
 	return u, nil
 }
 
-// NetworkStateFor returns one network's state for one host, as an attach
-// answers it.
-func NetworkStateFor(tx store.ReadTx, cache Cache, net model.NetworkID, host model.HostID) (api.NetworkState, error) {
-	n, err := tx.Network(net)
+// AttachState answers an attach with its interface's network as its host
+// builds it. It reads after the attach commits, so it carries the revision
+// the attach made. A rescope or revocation since may have ended the
+// interface, and only a live interface's network lies within its host's
+// scope, so an ended one answers with nothing of its network.
+func AttachState(tx store.ReadTx, cache Cache, id model.InterfaceID, host model.HostID) (api.NetworkState, error) {
+	i, err := tx.Interface(id)
+	if err == nil && i.Host != host {
+		// The interface expired and another host attached under its
+		// identifier.
+		err = store.ErrNotFound
+	}
 	if err != nil {
-		return api.NetworkState{}, notFound(err, "network "+string(net))
+		return api.NetworkState{}, notFound(err, "interface "+string(id))
+	}
+	if i.State != api.Live {
+		return api.NetworkState{}, apiErr(api.CodeConflict, "interface %s was %s before its attach answered", id, i.State)
+	}
+	n, err := tx.Network(i.Network)
+	if err != nil {
+		return api.NetworkState{}, notFound(err, "network "+string(i.Network))
 	}
 	c, err := CompileNetwork(tx, cache, n)
 	if err != nil {

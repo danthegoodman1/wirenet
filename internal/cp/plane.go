@@ -42,6 +42,8 @@ type Config struct {
 	Retention time.Duration
 	// MTU is a new network's overlay MTU unless it names one.
 	MTU int
+	// Quota bounds a new network unless it names its own.
+	Quota api.Quota
 }
 
 // DefaultConfig returns the production clocks.
@@ -69,6 +71,8 @@ func (c Config) Validate() error {
 		return errors.New("retention must cover the drain grace period")
 	case c.MTU < 1280:
 		return errors.New("MTU must be at least 1280, the IPv6 minimum")
+	case validQuota(c.Quota) != nil:
+		return errors.New("a default quota's bounds are zero, for none, or positive")
 	}
 	return nil
 }
@@ -158,7 +162,7 @@ func bump(tx store.Tx, now time.Time, n *store.Network, hosts ...model.HostID) e
 	return bumpHosts(tx, hosts)
 }
 
-// bumpHosts gives hosts whose interface set changed this transaction's
+// bumpHosts gives hosts whose poll answer changed this transaction's
 // revision, and records the touch.
 func bumpHosts(tx store.Tx, hosts []model.HostID) error {
 	if len(hosts) == 0 {
@@ -259,6 +263,10 @@ func (p *Plane) CreateNetwork(tx store.Tx, now time.Time, req api.CreateNetwork)
 			return store.Network{}, notFound(err, "relay "+string(r))
 		}
 	}
+	if err := validQuota(req.Quota); err != nil {
+		return store.Network{}, err
+	}
+	quota := mergeQuota(req.Quota, p.Config.Quota)
 	id, err := p.id(model.NetworkPrefix)
 	if err != nil {
 		return store.Network{}, err
@@ -273,6 +281,7 @@ func (p *Plane) CreateNetwork(tx store.Tx, now time.Time, req api.CreateNetwork)
 		Next6:   first6,
 		Next4:   first4,
 		Created: now,
+		Quota:   quota,
 	}
 	if err := tx.PutNetwork(n); err != nil {
 		return store.Network{}, conflict(err, "network "+req.Name)
@@ -326,13 +335,17 @@ func (p *Plane) DeleteNetwork(tx store.Tx, ref string) error {
 	if err := bumpHosts(tx, slices.Compact(hosts)); err != nil {
 		return err
 	}
+	if err := dropFromScopes(tx, n.ID); err != nil {
+		return err
+	}
 	tx.Touch(store.Change{Networks: []model.NetworkID{n.ID}})
 	return tx.DeleteNetwork(n.ID)
 }
 
-// CreateService declares a service and gives it its addresses.
-func (p *Plane) CreateService(tx store.Tx, now time.Time, netRef string, req api.CreateService) (store.Service, error) {
-	n, err := ResolveNetwork(tx, netRef)
+// CreateService declares a service and gives it its addresses, in a
+// network the scope by admits.
+func (p *Plane) CreateService(tx store.Tx, now time.Time, by store.Scope, netRef string, req api.CreateService) (store.Service, error) {
+	n, err := ResolveNetworkIn(tx, by, netRef)
 	if err != nil {
 		return store.Service{}, err
 	}
@@ -348,6 +361,16 @@ func (p *Plane) CreateService(tx store.Tx, now time.Time, netRef string, req api
 	}
 	if _, err := tx.ServiceByName(n.ID, req.Name); err == nil {
 		return store.Service{}, apiErr(api.CodeConflict, "service %s already exists", req.Name)
+	}
+	// Only a bounded network pays for the count.
+	if n.Quota.Services > 0 {
+		svcs, err := tx.Services(n.ID)
+		if err != nil {
+			return store.Service{}, err
+		}
+		if err := overQuota("services", n.Quota.Services, len(svcs), len(svcs)+1); err != nil {
+			return store.Service{}, err
+		}
 	}
 	id, err := p.id(model.ServicePrefix)
 	if err != nil {
@@ -368,8 +391,8 @@ func (p *Plane) CreateService(tx store.Tx, now time.Time, netRef string, req api
 
 // DeleteService removes a service with no connected interfaces, and the
 // rules naming it.
-func (p *Plane) DeleteService(tx store.Tx, now time.Time, netRef, ref string) error {
-	n, err := ResolveNetwork(tx, netRef)
+func (p *Plane) DeleteService(tx store.Tx, now time.Time, by store.Scope, netRef, ref string) error {
+	n, err := ResolveNetworkIn(tx, by, netRef)
 	if err != nil {
 		return err
 	}
@@ -410,10 +433,16 @@ func (p *Plane) DeleteService(tx store.Tx, now time.Time, netRef, ref string) er
 
 // CreateRule allows or denies flows from a service, or every service, to a
 // service, every service, or the internet.
-func (p *Plane) CreateRule(tx store.Tx, now time.Time, netRef string, req api.CreateRule) (store.Rule, error) {
-	n, err := ResolveNetwork(tx, netRef)
+func (p *Plane) CreateRule(tx store.Tx, now time.Time, by store.Scope, netRef string, req api.CreateRule) (store.Rule, error) {
+	n, err := ResolveNetworkIn(tx, by, netRef)
 	if err != nil {
 		return store.Rule{}, err
+	}
+	// A rule to the internet sends traffic out from the host's own
+	// addresses, which on a shared host are the operator's, so a scoped
+	// caller may narrow egress and never widen it.
+	if req.To == api.Internet && req.Action != api.Deny && !by.Global {
+		return store.Rule{}, apiErr(api.CodeForbidden, "only the operator grants internet egress")
 	}
 	action := req.Action
 	if action == "" {
@@ -454,6 +483,9 @@ func (p *Plane) CreateRule(tx store.Tx, now time.Time, netRef string, req api.Cr
 			return r, nil
 		}
 	}
+	if err := overQuota("rules", n.Quota.Rules, len(rules), len(rules)+1); err != nil {
+		return store.Rule{}, err
+	}
 	id, err := p.id(model.RulePrefix)
 	if err != nil {
 		return store.Rule{}, err
@@ -463,7 +495,11 @@ func (p *Plane) CreateRule(tx store.Tx, now time.Time, netRef string, req api.Cr
 		return store.Rule{}, err
 	}
 	if to != "" {
-		if err := p.reconcileEdges(tx, now, &n, ruleScope(r)); err != nil {
+		h, err := p.reconcileEdges(tx, now, &n, ruleScope(r))
+		if err != nil {
+			return store.Rule{}, err
+		}
+		if err := overQuota("edges", n.Quota.Edges, h.edgesBefore, h.edgesAfter); err != nil {
 			return store.Rule{}, err
 		}
 	}
@@ -480,8 +516,8 @@ func ruleSide(tx store.ReadTx, net model.NetworkID, ref string) (model.ServiceID
 }
 
 // DeleteRule removes a rule, and the edges no other rule keeps.
-func (p *Plane) DeleteRule(tx store.Tx, now time.Time, netRef string, id model.RuleID) error {
-	n, err := ResolveNetwork(tx, netRef)
+func (p *Plane) DeleteRule(tx store.Tx, now time.Time, by store.Scope, netRef string, id model.RuleID) error {
+	n, err := ResolveNetworkIn(tx, by, netRef)
 	if err != nil {
 		return err
 	}
@@ -492,21 +528,36 @@ func (p *Plane) DeleteRule(tx store.Tx, now time.Time, netRef string, id model.R
 	if r.Network != n.ID {
 		return notFound(store.ErrNotFound, "rule "+string(id))
 	}
+	if r.To == "" && r.Deny && !by.Global {
+		return apiErr(api.CodeForbidden, "only the operator lifts a deny on internet egress")
+	}
 	if err := tx.DeleteRule(id); err != nil {
 		return err
 	}
+	// Deleting a deny connects what it held apart, so it can add edges.
 	if r.To != "" {
-		if err := p.reconcileEdges(tx, now, &n, ruleScope(r)); err != nil {
+		h, err := p.reconcileEdges(tx, now, &n, ruleScope(r))
+		if err != nil {
+			return err
+		}
+		if err := overQuota("edges", n.Quota.Edges, h.edgesBefore, h.edgesAfter); err != nil {
 			return err
 		}
 	}
 	return bump(tx, now, &n)
 }
 
-// CreateHost registers a host and returns its token.
-func (p *Plane) CreateHost(tx store.Tx, now time.Time, req api.CreateHost) (store.Host, string, error) {
+// CreateHost registers a host and returns its token. A host the request
+// scopes to networks may attach only into them, each within the scope by
+// of the principal registering it; a host given none is global, which only
+// a global principal registers.
+func (p *Plane) CreateHost(tx store.Tx, now time.Time, by store.Scope, req api.CreateHost) (store.Host, string, error) {
 	if !ValidName(req.Name) {
 		return store.Host{}, "", apiErr(api.CodeInvalid, "host name %q is not a DNS label", req.Name)
+	}
+	sc, err := hostScope(tx, by, api.Scope{Global: len(req.Networks) == 0, Networks: req.Networks})
+	if err != nil {
+		return store.Host{}, "", err
 	}
 	id, err := p.id(model.HostPrefix)
 	if err != nil {
@@ -516,7 +567,7 @@ func (p *Plane) CreateHost(tx store.Tx, now time.Time, req api.CreateHost) (stor
 	if err != nil {
 		return store.Host{}, "", err
 	}
-	h := store.Host{ID: model.HostID(id), Name: req.Name, TokenHash: hash, Endpoint: req.Endpoint, Created: now}
+	h := store.Host{ID: model.HostID(id), Name: req.Name, TokenHash: hash, Endpoint: req.Endpoint, Scope: sc, Created: now}
 	if err := tx.PutHost(h); err != nil {
 		return store.Host{}, "", conflict(err, "host "+req.Name)
 	}
@@ -527,8 +578,8 @@ func (p *Plane) CreateHost(tx store.Tx, now time.Time, req api.CreateHost) (stor
 // host holds, which ends the development machines behind its gateways too,
 // and deletes their records with the host's, since no host is left to learn
 // their state.
-func (p *Plane) DeleteHost(tx store.Tx, now time.Time, ref string) (store.Host, error) {
-	h, err := ResolveHost(tx, ref)
+func (p *Plane) DeleteHost(tx store.Tx, now time.Time, by store.Scope, ref string) (store.Host, error) {
+	h, err := ResolveHostIn(tx, by, ref)
 	if err != nil {
 		return store.Host{}, err
 	}
@@ -665,7 +716,11 @@ func (p *Plane) Attach(tx store.Tx, now time.Time, host model.HostID, req api.At
 	if req.Replace && req.Member == "" {
 		return store.Interface{}, "", apiErr(api.CodeInvalid, "replace names the member it takes over")
 	}
-	n, err := ResolveNetwork(tx, req.Network)
+	h, err := tx.Host(host)
+	if err != nil {
+		return store.Interface{}, "", notFound(err, "host "+string(host))
+	}
+	n, err := ResolveNetworkIn(tx, h.Scope, req.Network)
 	if err != nil {
 		return store.Interface{}, "", err
 	}
@@ -673,10 +728,10 @@ func (p *Plane) Attach(tx store.Tx, now time.Time, host model.HostID, req api.At
 	if err != nil {
 		return store.Interface{}, "", err
 	}
-	if _, err := tx.Host(host); err != nil {
-		return store.Interface{}, "", notFound(err, "host "+string(host))
-	}
 	var replaced model.InterfaceID
+	// edgesFrom is the edge count the quota check runs from. A replacement
+	// counts from before its holder's revocation took its edges away.
+	edgesFrom := -1
 	if req.Member != "" {
 		holder, err := tx.Holder(svc.ID, req.Member)
 		switch {
@@ -688,10 +743,11 @@ func (p *Plane) Attach(tx store.Tx, now time.Time, host model.HostID, req api.At
 		default:
 			// Revoking removes the holder from every peer at once, so it
 			// reaches nothing once hosts converge on this revision.
-			if err := p.Revoke(tx, now, holder.ID); err != nil {
+			gone, err := p.revoke(tx, now, holder.ID)
+			if err != nil {
 				return store.Interface{}, "", err
 			}
-			replaced = holder.ID
+			edgesFrom, replaced = gone.edgesBefore, holder.ID
 			if n, err = tx.Network(n.ID); err != nil {
 				return store.Interface{}, "", err
 			}
@@ -719,7 +775,21 @@ func (p *Plane) Attach(tx store.Tx, now time.Time, host model.HostID, req api.At
 	if err := tx.PutInterface(iface); err != nil {
 		return store.Interface{}, "", err
 	}
-	if err := p.reconcileEdges(tx, now, &n, interfaceScope(iface.ID)); err != nil {
+	held, err := p.reconcileEdges(tx, now, &n, interfaceScope(iface.ID))
+	if err != nil {
+		return store.Interface{}, "", err
+	}
+	// A replacement revoked its holder, so the interfaces it holds stay,
+	// and its edges count from before the holder's went.
+	if replaced == "" {
+		if err := overQuota("live interfaces", n.Quota.Interfaces, held.live-1, held.live); err != nil {
+			return store.Interface{}, "", err
+		}
+	}
+	if edgesFrom < 0 {
+		edgesFrom = held.edgesBefore
+	}
+	if err := overQuota("edges", n.Quota.Edges, edgesFrom, held.edgesAfter); err != nil {
 		return store.Interface{}, "", err
 	}
 	return iface, replaced, bump(tx, now, &n, host)
@@ -731,26 +801,31 @@ const MaxDeviceTTL = 30 * 24 * time.Hour
 // CreateDevice registers a development machine behind a gateway interface
 // with a fixed-term lease. The caller minted the key and sends only its
 // public half.
-func (p *Plane) CreateDevice(tx store.Tx, now time.Time, netRef string, req api.CreateDevice) (store.Interface, error) {
+func (p *Plane) CreateDevice(tx store.Tx, now time.Time, by store.Scope, netRef string, req api.CreateDevice) (store.Interface, error) {
+	n, err := ResolveNetworkIn(tx, by, netRef)
+	if err != nil {
+		return store.Interface{}, err
+	}
 	if req.PublicKey.IsZero() {
 		return store.Interface{}, apiErr(api.CodeInvalid, "a device needs a public key")
 	}
 	if req.TTL <= 0 || req.TTL > MaxDeviceTTL {
 		return store.Interface{}, apiErr(api.CodeInvalid, "a device's term must lie between zero and %v", MaxDeviceTTL)
 	}
-	n, err := ResolveNetwork(tx, netRef)
-	if err != nil {
-		return store.Interface{}, err
-	}
 	svc, err := ResolveService(tx, n.ID, req.Service)
 	if err != nil {
 		return store.Interface{}, err
 	}
+	// An interface of another network reads as absent, as one outside a
+	// caller's scope does.
 	gw, err := tx.Interface(req.Gateway)
+	if err == nil && gw.Network != n.ID {
+		err = store.ErrNotFound
+	}
 	if err != nil {
 		return store.Interface{}, notFound(err, "gateway "+string(req.Gateway))
 	}
-	if gw.Kind != api.Gateway || gw.State != api.Live || gw.Network != n.ID {
+	if gw.Kind != api.Gateway || gw.State != api.Live {
 		return store.Interface{}, apiErr(api.CodeInvalid, "%s is not a live gateway of network %s", gw.ID, n.Name)
 	}
 	h, err := tx.Host(gw.Host)
@@ -779,7 +854,14 @@ func (p *Plane) CreateDevice(tx store.Tx, now time.Time, netRef string, req api.
 	if err := tx.PutInterface(d); err != nil {
 		return store.Interface{}, err
 	}
-	if err := p.reconcileEdges(tx, now, &n, interfaceScope(gw.ID)); err != nil {
+	held, err := p.reconcileEdges(tx, now, &n, interfaceScope(gw.ID))
+	if err != nil {
+		return store.Interface{}, err
+	}
+	if err := overQuota("live interfaces", n.Quota.Interfaces, held.live-1, held.live); err != nil {
+		return store.Interface{}, err
+	}
+	if err := overQuota("edges", n.Quota.Edges, held.edgesBefore, held.edgesAfter); err != nil {
 		return store.Interface{}, err
 	}
 	return d, bump(tx, now, &n, gw.Host)
@@ -841,7 +923,7 @@ func (p *Plane) Release(tx store.Tx, now time.Time, host model.HostID, ids []mod
 			continue
 		}
 		i.State, i.Ended = api.Released, now
-		if err := p.end(tx, now, i, false); err != nil {
+		if _, err := p.end(tx, now, i, false); err != nil {
 			return err
 		}
 	}
@@ -850,12 +932,19 @@ func (p *Plane) Release(tx store.Tx, now time.Time, host model.HostID, ids []mod
 
 // Revoke ends an interface at once: peers remove it with no grace period.
 func (p *Plane) Revoke(tx store.Tx, now time.Time, id model.InterfaceID) error {
+	_, err := p.revoke(tx, now, id)
+	return err
+}
+
+// revoke is Revoke, returning what the network held around the edges the
+// interface gave up.
+func (p *Plane) revoke(tx store.Tx, now time.Time, id model.InterfaceID) (holdings, error) {
 	i, err := tx.Interface(id)
 	if err != nil {
-		return notFound(err, "interface "+string(id))
+		return holdings{}, notFound(err, "interface "+string(id))
 	}
 	if i.State == api.Revoked {
-		return nil
+		return holdings{}, nil
 	}
 	if i.State == api.Live {
 		i.Ended = now
@@ -869,31 +958,34 @@ func (p *Plane) Revoke(tx store.Tx, now time.Time, id model.InterfaceID) error {
 
 // end writes an interface that just left the live state, quarantines its
 // IPv4 address if asked, revokes the development machines behind a gateway,
-// drops its edges once it is drained, and bumps its network.
-func (p *Plane) end(tx store.Tx, now time.Time, i store.Interface, quarantine bool) error {
+// drops its edges once it is drained, and bumps its network. It returns
+// what the network held around the edges it dropped, and nothing for an
+// interface still draining.
+func (p *Plane) end(tx store.Tx, now time.Time, i store.Interface, quarantine bool) (holdings, error) {
 	if quarantine && i.Addr4.IsValid() {
 		if err := tx.PutReleased4(store.Released4{Network: i.Network, Addr: i.Addr4, At: now}); err != nil {
-			return err
+			return holdings{}, err
 		}
 	}
 	if err := tx.PutInterface(i); err != nil {
-		return err
+		return holdings{}, err
 	}
 	if i.Kind == api.Gateway {
 		if err := p.endDevices(tx, now, i); err != nil {
-			return err
+			return holdings{}, err
 		}
 	}
 	n, err := tx.Network(i.Network)
 	if err != nil {
-		return err
+		return holdings{}, err
 	}
+	var held holdings
 	if i.Drained {
-		if err := p.reconcileEdges(tx, now, &n, edgeScope(i)); err != nil {
-			return err
+		if held, err = p.reconcileEdges(tx, now, &n, edgeScope(i)); err != nil {
+			return holdings{}, err
 		}
 	}
-	return bump(tx, now, &n, i.Host)
+	return held, bump(tx, now, &n, i.Host)
 }
 
 // endDevices revokes the development machines behind a gateway that just
@@ -984,7 +1076,7 @@ func (p *Plane) Sweep(tx store.Tx, now time.Time) (int, error) {
 		if err != nil {
 			return 0, err
 		}
-		if err := p.reconcileEdges(tx, now, &n, edgeScope(i)); err != nil {
+		if _, err := p.reconcileEdges(tx, now, &n, edgeScope(i)); err != nil {
 			return 0, err
 		}
 		if err := bump(tx, now, &n, i.Host); err != nil {

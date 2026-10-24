@@ -58,13 +58,16 @@ type Summary struct {
 	// whose two ends send through different relays, and RelayDrift those
 	// whose ends agree on a relay other than the heaviest both find up.
 	RelayEdges, RelaySplit, RelayDrift int
+	// Rescopes counts changes to a host's scope, and ScopeRefusals the
+	// attaches refused because the host's scope left their network out.
+	Rescopes, ScopeRefusals int
 }
 
 func (s Summary) String() string {
-	return fmt.Sprintf("seed %d: %d events; %d attaches, %d detaches, %d revokes, %d rule changes, %d egress grants, %d wildcard and deny changes; crashes agent %d relay %d cp %d, reboots %d, rebinds %d, strays %d, unnamed %d; flows ok %d denied %d; batches %d, conflicts %d, failovers %d, registrations %d, withdrawals %d, acked %d, ack timeouts %d, attacker sent %d; members %d, member conflicts %d, replacements %d; relay edges %d, split %d, drifted %d",
+	return fmt.Sprintf("seed %d: %d events; %d attaches, %d detaches, %d revokes, %d rule changes, %d egress grants, %d wildcard and deny changes; crashes agent %d relay %d cp %d, reboots %d, rebinds %d, strays %d, unnamed %d; flows ok %d denied %d; batches %d, conflicts %d, failovers %d, registrations %d, withdrawals %d, acked %d, ack timeouts %d, attacker sent %d; members %d, member conflicts %d, replacements %d; relay edges %d, split %d, drifted %d; rescopes %d, scope refusals %d",
 		s.Seed, s.Events, s.Attaches, s.Detaches, s.Revokes, s.Rules, s.EgressGrants, s.Policies, s.AgentCrashes, s.RelayCrashes, s.CPCrashes,
 		s.Reboots, s.Rebinds, s.Strays, s.Unnamed, s.FlowsOK, s.FlowsDenied, s.Batches, s.Conflicts, s.Failovers, s.Registrations, s.Withdrawals, s.Acked, s.AckTimeouts, s.AttackerSent,
-		s.Members, s.MemberConflicts, s.Replacements, s.RelayEdges, s.RelaySplit, s.RelayDrift)
+		s.Members, s.MemberConflicts, s.Replacements, s.RelayEdges, s.RelaySplit, s.RelayDrift, s.Rescopes, s.ScopeRefusals)
 }
 
 // World is one simulated deployment.

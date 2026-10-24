@@ -281,6 +281,10 @@ func (e *localEnv) Ctl(ctx context.Context, n Node, args ...string) ([]byte, err
 	return output(cmd, n.Name)
 }
 
+func (e *localEnv) OperatorAPI() (string, []string) {
+	return e.lab.CPURL, []string{"--token", e.lab.Token}
+}
+
 func (e *localEnv) Metrics(ctx context.Context, n Node) (string, error) {
 	switch {
 	case n.Role == RoleCP:

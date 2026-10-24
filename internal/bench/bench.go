@@ -174,6 +174,28 @@ const MissedKept = 8
 // Elapsed is the time from the loop's start to convergence.
 func (d Dial) Elapsed() time.Duration { return time.Duration(d.Converged - d.Start) }
 
+// API is a run of admin calls with one token. Each round reads a network,
+// then creates a rule in it and deletes it again, each call timed alone.
+type API struct {
+	Read   Latency `json:"read"`
+	Create Latency `json:"create"`
+	Delete Latency `json:"delete"`
+	// Writes counts the creates and deletes sent, Limited those refused
+	// with 429, and Failures every other answer but 200.
+	Writes   int `json:"writes"`
+	Limited  int `json:"limited"`
+	Failures int `json:"failures"`
+	// Hidden is the status a second network answered.
+	Hidden  int     `json:"hidden,omitempty"`
+	Seconds float64 `json:"seconds"`
+	// Samples holds every successful call's time in milliseconds, by
+	// call, so runs pool exactly.
+	Samples map[string][]float64 `json:"samples"`
+	// Answered holds when each write that succeeded was answered, in
+	// seconds from the run's start.
+	Answered []float64 `json:"answered"`
+}
+
 // Attach is a run of attach-to-first-connection rounds.
 type Attach struct {
 	Rounds    []AttachRound `json:"rounds"`

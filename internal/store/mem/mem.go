@@ -28,6 +28,7 @@ type Store struct {
 	edges      table[edgeKey, store.Edge]
 	hosts      table[model.HostID, store.Host]
 	relays     table[model.RelayID, store.Relay]
+	admins     table[model.AdminID, store.Admin]
 	released4  table[addrKey, store.Released4]
 	ports      table[portKey, store.ReleasedPort]
 	cursors    table[addrKey, uint16]
@@ -73,8 +74,9 @@ func New() *Store {
 		interfaces: newTable[model.InterfaceID, store.Interface](cmp.Compare[model.InterfaceID], nil),
 		rules:      newTable[model.RuleID, store.Rule](cmp.Compare[model.RuleID], nil),
 		edges:      newTable(edgeKey.compare, cloneEdge),
-		hosts:      newTable[model.HostID, store.Host](cmp.Compare[model.HostID], nil),
+		hosts:      newTable(cmp.Compare[model.HostID], cloneHost),
 		relays:     newTable(cmp.Compare[model.RelayID], cloneRelay),
+		admins:     newTable(cmp.Compare[model.AdminID], cloneAdmin),
 		released4:  newTable[addrKey, store.Released4](cmp.Compare[addrKey], nil),
 		ports: newTable[portKey, store.ReleasedPort](func(a, b portKey) int {
 			return cmp.Or(cmp.Compare(a.addr, b.addr), cmp.Compare(a.port, b.port))
@@ -120,6 +122,7 @@ type tx struct {
 	edges      *overlay[edgeKey, store.Edge]
 	hosts      *overlay[model.HostID, store.Host]
 	relays     *overlay[model.RelayID, store.Relay]
+	admins     *overlay[model.AdminID, store.Admin]
 	released4  *overlay[addrKey, store.Released4]
 	ports      *overlay[portKey, store.ReleasedPort]
 	cursors    *overlay[addrKey, uint16]
@@ -138,6 +141,7 @@ func (s *Store) begin() *tx {
 		edges:      s.edges.overlay(),
 		hosts:      s.hosts.overlay(),
 		relays:     s.relays.overlay(),
+		admins:     s.admins.overlay(),
 		released4:  s.released4.overlay(),
 		ports:      s.ports.overlay(),
 		cursors:    s.cursors.overlay(),
@@ -153,6 +157,7 @@ func (t *tx) commit() {
 	t.edges.commit()
 	t.hosts.commit()
 	t.relays.commit()
+	t.admins.commit()
 	t.released4.commit()
 	t.ports.commit()
 	t.cursors.commit()
@@ -248,6 +253,17 @@ func (t *tx) HostByToken(hash [32]byte) (store.Host, error) {
 	return first(t.hosts.scan(func(h store.Host) bool { return h.TokenHash == hash }))
 }
 
+func (t *tx) Hosts() ([]store.Host, error) { return t.hosts.scan(nil), nil }
+
+func (t *tx) Admin(id model.AdminID) (store.Admin, error) { return found(t.admins.get(id)) }
+func (t *tx) AdminByName(name string) (store.Admin, error) {
+	return first(t.admins.scan(func(a store.Admin) bool { return a.Name == name }))
+}
+func (t *tx) AdminByToken(hash [32]byte) (store.Admin, error) {
+	return first(t.admins.scan(func(a store.Admin) bool { return a.TokenHash == hash }))
+}
+func (t *tx) Admins() ([]store.Admin, error) { return t.admins.scan(nil), nil }
+
 func (t *tx) Relay(id model.RelayID) (store.Relay, error) { return found(t.relays.get(id)) }
 func (t *tx) RelayByName(name string) (store.Relay, error) {
 	return first(t.relays.scan(func(r store.Relay) bool { return r.Name == name }))
@@ -334,6 +350,16 @@ func (t *tx) PutHost(h store.Host) error {
 }
 
 func (t *tx) DeleteHost(id model.HostID) error { t.hosts.delete(id); return nil }
+
+func (t *tx) PutAdmin(a store.Admin) error {
+	if dup(t.admins.scan(func(o store.Admin) bool { return o.Name == a.Name && o.ID != a.ID })) {
+		return store.ErrConflict
+	}
+	t.admins.set(a.ID, a)
+	return nil
+}
+
+func (t *tx) DeleteAdmin(id model.AdminID) error { t.admins.delete(id); return nil }
 
 func (t *tx) PutRelay(r store.Relay) error {
 	if dup(t.relays.scan(func(o store.Relay) bool { return o.Name == r.Name && o.ID != r.ID })) {
@@ -426,6 +452,11 @@ func (t *table[K, V]) detach(v V) V {
 func cloneNetwork(n store.Network) store.Network { n.Relays = slices.Clone(n.Relays); return n }
 func cloneRelay(r store.Relay) store.Relay       { r.Addresses = slices.Clone(r.Addresses); return r }
 func cloneEdge(e store.Edge) store.Edge          { e.Ports = slices.Clone(e.Ports); return e }
+func cloneHost(h store.Host) store.Host          { h.Scope.Networks = slices.Clone(h.Scope.Networks); return h }
+func cloneAdmin(a store.Admin) store.Admin {
+	a.Scope.Networks = slices.Clone(a.Scope.Networks)
+	return a
+}
 
 func (t *table[K, V]) overlay() *overlay[K, V] {
 	return &overlay[K, V]{base: t, put: map[K]V{}, del: map[K]bool{}}

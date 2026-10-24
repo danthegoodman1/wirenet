@@ -236,6 +236,10 @@ func (e *awsEnv) Ctl(ctx context.Context, n Node, args ...string) ([]byte, error
 	return out, err
 }
 
+func (e *awsEnv) OperatorAPI() (string, []string) {
+	return fmt.Sprintf("http://127.0.0.1:%d", cpPort), []string{"--token-file", "/etc/wirenet/admin-token"}
+}
+
 // awsProc is a process systemd runs as a transient unit.
 type awsProc struct {
 	e    *awsEnv
@@ -536,7 +540,7 @@ func (f *fakes) ctl(args []string) []byte {
 		return fmt.Appendf(nil, `{"id":"dry-net-%d","name":%q,"prefix6":"fd00:d27::/64"}`, n, args[2])
 	case "service create":
 		return fmt.Appendf(nil, `{"id":"dry-svc-%d","name":%q,"addr6":"fd00:d27::%x"}`, n, args[3], n)
-	case "relay create", "host create":
+	case "relay create", "host create", "admin create":
 		return fmt.Appendf(nil, `{"id":"dry-%s","token":"dry-run"}`, args[2])
 	case "relay list":
 		return []byte(`[{"id":"dry-r1","name":"r1"},{"id":"dry-r2","name":"r2"},{"id":"dry-mid","name":"mid"}]`)

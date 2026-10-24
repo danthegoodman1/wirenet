@@ -3,6 +3,7 @@ package pgstore_test
 import (
 	"context"
 	"fmt"
+	"os"
 	"slices"
 	"strings"
 	"testing"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/danthegoodman1/wirenet/internal/api"
 	"github.com/danthegoodman1/wirenet/internal/model"
 	"github.com/danthegoodman1/wirenet/internal/store"
 	"github.com/danthegoodman1/wirenet/internal/store/pgstore"
@@ -224,6 +226,63 @@ func notify(t *testing.T, payload string) {
 		}
 	}()
 	if _, err := conn.Exec(t.Context(), "SELECT pg_notify($1, $2)", pgstore.Channel, payload); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestScopesMigrationKeepsEarlierHostsGlobal builds a schema at 0006 with a
+// host and a network written before scopes existed, then opens it, which
+// applies 0007: the host stays global and the network bounds nothing.
+func TestScopesMigrationKeepsEarlierHostsGlobal(t *testing.T) {
+	dsn := pgtest.NewSchema(t)
+	ctx := t.Context()
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stmts := []string{`CREATE TABLE schema_migrations (
+		version text COLLATE "C" PRIMARY KEY,
+		applied timestamptz NOT NULL DEFAULT now()
+	)`}
+	for _, v := range []string{"0001_init", "0002_network_changed", "0003_rule_deny", "0004_edge_epoch", "0005_drop_edge_epoch", "0006_interface_member"} {
+		b, err := os.ReadFile("schema/" + v + ".sql")
+		if err != nil {
+			t.Fatal(err)
+		}
+		stmts = append(stmts, string(b), fmt.Sprintf("INSERT INTO schema_migrations (version) VALUES ('%s')", v))
+	}
+	stmts = append(stmts,
+		`INSERT INTO hosts (id, name, token_hash, endpoint, revision, created)
+		VALUES ('host-old', 'old', decode(repeat('07', 32), 'hex'), '', 1, now())`,
+		`INSERT INTO networks (id, name, mtu, relays, next6, next4, revision, created, changed)
+		VALUES ('net-old', 'old', 1380, '[]', 256, 1, 1, now(), now())`,
+	)
+	for _, sql := range stmts {
+		if _, err := conn.Exec(ctx, sql); err != nil {
+			t.Fatalf("%.60s: %v", sql, err)
+		}
+	}
+	if err := conn.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	s := pgtest.OpenDSN(t, dsn)
+	if err := s.View(ctx, func(tx store.ReadTx) error {
+		h, err := tx.Host("host-old")
+		if err != nil {
+			return err
+		}
+		if !h.Scope.Global || h.Scope.Networks != nil {
+			t.Errorf("an earlier host's scope is %+v, want global", h.Scope)
+		}
+		n, err := tx.Network("net-old")
+		if err != nil {
+			return err
+		}
+		if n.Quota != (api.Quota{}) {
+			t.Errorf("an earlier network's quota is %+v, want none", n.Quota)
+		}
+		return nil
+	}); err != nil {
 		t.Fatal(err)
 	}
 }

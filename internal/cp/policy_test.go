@@ -20,7 +20,7 @@ func (f *fixture) createRule(net string, req api.CreateRule) (store.Rule, error)
 	var r store.Rule
 	err := f.tryUpdate(func(tx store.Tx) error {
 		var err error
-		r, err = f.p.CreateRule(tx, f.now, net, req)
+		r, err = f.p.CreateRule(tx, f.now, Global(), net, req)
 		return err
 	})
 	return r, err
@@ -98,7 +98,7 @@ func TestAWildcardPeersEveryOtherServiceAndADenyCutsOneOut(t *testing.T) {
 			db.ID: {web.ID}, web.ID: {db.ID, box1.ID, box2.ID}, box1.ID: {web.ID}, box2.ID: {web.ID},
 		}, [][2]model.InterfaceID{pairOf(db.ID, web.ID), pairOf(web.ID, box2.ID)})
 
-		f.update(func(tx store.Tx) error { return f.p.DeleteRule(tx, f.now, "n", boxOut.ID) })
+		f.update(func(tx store.Tx) error { return f.p.DeleteRule(tx, f.now, Global(), "n", boxOut.ID) })
 		check("the deny gone", map[model.InterfaceID][]model.InterfaceID{
 			db.ID: {web.ID, box1.ID, box2.ID}, web.ID: {db.ID, box1.ID, box2.ID}, box1.ID: {db.ID, web.ID}, box2.ID: {db.ID, web.ID},
 		}, [][2]model.InterfaceID{pairOf(db.ID, web.ID), pairOf(web.ID, box2.ID), pairOf(db.ID, box1.ID), pairOf(db.ID, box2.ID)})

@@ -94,6 +94,8 @@ var plans = []plan{
 		true, []string{"clients"}, planPolicy},
 	{"members", "a three-member etcd cluster in one service, each member holding its name; move one member to another host each round, timing its name, health and catching up, and checking the replaced holder reaches no peer",
 		true, []string{"rounds"}, planMembers},
+	{"scopes", "a scoped host and admin token beside another network: what each reaches, a host's attach while global against while scoped, the operator's admin calls against a scoped token's, a quota's refusal, and a burst past the limits",
+		true, []string{"degree", "rounds"}, planScopes},
 }
 
 func findPlans(spec string) ([]plan, error) {

@@ -178,8 +178,9 @@ func (c *cpNode) view(fn func(store.ReadTx) error) error {
 
 // record snapshots a network's interfaces at its revision and checks that
 // addresses are unique among connected interfaces, that IPv6 addresses are
-// never reused, that IPv4 addresses wait out their quarantine, and that each
-// member name has at most one live holder, the one that asked for it.
+// never reused, that IPv4 addresses wait out their quarantine, that each
+// member name has at most one live holder, the one that asked for it, and
+// that no interface on its peers sits outside its host's scope.
 func (c *cpNode) record(id model.NetworkID) {
 	now := c.w.now()
 	c.view(func(tx store.ReadTx) error {
@@ -199,8 +200,28 @@ func (c *cpNode) record(id model.NetworkID) {
 		if c.w.orch != nil {
 			requested = c.w.orch.requested
 		}
+		hosts := map[model.HostID]store.Host{}
+		hostOf := func(id model.HostID) (store.Host, bool) {
+			h, ok := hosts[id]
+			if !ok {
+				var err error
+				if h, err = tx.Host(id); err != nil {
+					return h, false
+				}
+				hosts[id] = h
+			}
+			return h, true
+		}
 		holders := map[[2]string]model.InterfaceID{}
 		for _, i := range ifaces {
+			// An interface still draining is on its peers. A development
+			// machine's host is its gateway's, so the gateway's own
+			// interface answers for it.
+			if onPeers := i.State == api.Live || i.State == api.Released && !i.Drained; onPeers && i.Kind != api.Device {
+				if h, ok := hostOf(i.Host); ok && !admits(h.Scope, id) {
+					c.w.fail("%s is %s in %s, which its host %s's scope %+v leaves out", i.ID, i.State, id, h.Name, h.Scope)
+				}
+			}
 			if want, ok := requested[i.ID]; ok && i.Member != want {
 				c.w.fail("%s holds member %q, but its attach asked for %q", i.ID, i.Member, want)
 			}
@@ -325,7 +346,7 @@ func (c *cpNode) wake(ch store.Change) {
 				err = errors.New("nothing new")
 				return nil
 			}
-			u, err = cp.HostState(tx, c.cache, id, p.since)
+			u, err = c.hostState(tx, id, p.since)
 			return nil
 		})
 		if err == nil {
@@ -368,7 +389,7 @@ func (c *cpNode) expirePolls() {
 		var u api.StateUpdate
 		if c.view(func(tx store.ReadTx) error {
 			var err error
-			u, err = cp.HostState(tx, c.cache, id, p.since)
+			u, err = c.hostState(tx, id, p.since)
 			return err
 		}) == nil {
 			p.reply(u)
@@ -406,6 +427,14 @@ func (c *cpNode) handleAttach(host model.HostID, req api.AttachRequest, reply fu
 		return err
 	})
 	if err != nil {
+		c.view(func(tx store.ReadTx) error {
+			h, herr := tx.Host(host)
+			n, nerr := tx.NetworkByName(req.Network)
+			if herr == nil && nerr == nil && !admits(h.Scope, n.ID) {
+				c.w.summary.ScopeRefusals++
+			}
+			return nil
+		})
 		reply(nil, err)
 		return
 	}
@@ -415,7 +444,7 @@ func (c *cpNode) handleAttach(host model.HostID, req api.AttachRequest, reply fu
 	var ns api.NetworkState
 	err = c.view(func(tx store.ReadTx) error {
 		var err error
-		ns, err = cp.NetworkStateFor(tx, c.cache, iface.Network, host)
+		ns, err = cp.AttachState(tx, c.cache, iface.ID, host)
 		return err
 	})
 	reply(&api.AttachResponse{Interface: iface.ID, State: ns}, err)
@@ -460,7 +489,7 @@ func (c *cpNode) handlePoll(host model.HostID, since uint64, reply func(api.Stat
 		var u api.StateUpdate
 		if c.view(func(tx store.ReadTx) error {
 			var err error
-			u, err = cp.HostState(tx, c.cache, host, since)
+			u, err = c.hostState(tx, host, since)
 			return err
 		}) == nil {
 			reply(u)
@@ -496,4 +525,30 @@ func (c *cpNode) handleRelayPoll(relay model.RelayID, since uint64, reply func(a
 
 func sortedAddrPorts[V any](m map[netip.AddrPort]V) []netip.AddrPort {
 	return slices.SortedFunc(maps.Keys(m), netip.AddrPort.Compare)
+}
+
+// hostState answers a host's poll and checks that it carries no network
+// the host's scope leaves out.
+func (c *cpNode) hostState(tx store.ReadTx, host model.HostID, since uint64) (api.StateUpdate, error) {
+	u, err := cp.HostState(tx, c.cache, host, since)
+	if err != nil {
+		return u, err
+	}
+	h, err := tx.Host(host)
+	if err != nil {
+		return u, err
+	}
+	for _, ref := range u.Present {
+		if !admits(h.Scope, ref.Network) {
+			c.w.fail("%s's poll carries %s, which its scope %+v leaves out", h.Name, ref.Network, h.Scope)
+		}
+	}
+	return u, nil
+}
+
+// admits reads a scope as SPEC.md states it, apart from store.Scope.Admits,
+// so the check judges the control plane rather than repeating it: every
+// network when global, else exactly those listed.
+func admits(sc store.Scope, n model.NetworkID) bool {
+	return sc.Global || slices.Contains(sc.Networks, n)
 }

@@ -126,21 +126,30 @@ func (s scope) pairs(connected []store.Interface) [][2]store.Interface {
 	return out
 }
 
+// holdings is what a network holds once reconcileEdges has run, counted
+// from the rows it read: live interfaces, and edges before and after it.
+type holdings struct {
+	live                    int
+	edgesBefore, edgesAfter int
+}
+
 // reconcileEdges makes the network's edges within scope match what policy
 // and placement want: an edge for every policy-connected pair of connected
 // interfaces on different hosts, each with ports on every relay of the set.
-func (p *Plane) reconcileEdges(tx store.Tx, now time.Time, n *store.Network, sc scope) error {
+// It returns what the network then holds, so a change can check its quota
+// without reading again.
+func (p *Plane) reconcileEdges(tx store.Tx, now time.Time, n *store.Network, sc scope) (holdings, error) {
 	ifaces, err := tx.Interfaces(n.ID)
 	if err != nil {
-		return err
+		return holdings{}, err
 	}
 	rules, err := tx.Rules(n.ID)
 	if err != nil {
-		return err
+		return holdings{}, err
 	}
 	svcs, err := tx.Services(n.ID)
 	if err != nil {
-		return err
+		return holdings{}, err
 	}
 	links := compile.NewLinks(compile.NewAdjacency(compile.Resolve(svcs, rules)), ifaces)
 	if links.HasDevices() && sc.iface == "" {
@@ -169,8 +178,9 @@ func (p *Plane) reconcileEdges(tx store.Tx, now time.Time, n *store.Network, sc 
 	}
 	edges, err := tx.Edges(n.ID)
 	if err != nil {
-		return err
+		return holdings{}, err
 	}
+	h := holdings{live: live(ifaces), edgesBefore: len(edges), edgesAfter: len(edges)}
 	var touched []model.RelayID
 	have := map[[2]model.InterfaceID]bool{}
 	for _, e := range edges {
@@ -187,7 +197,7 @@ func (p *Plane) reconcileEdges(tx store.Tx, now time.Time, n *store.Network, sc 
 			if !e.Dormant.IsZero() {
 				e.Dormant = time.Time{}
 				if err := tx.PutEdge(e); err != nil {
-					return err
+					return holdings{}, err
 				}
 			}
 		case attached:
@@ -198,16 +208,17 @@ func (p *Plane) reconcileEdges(tx store.Tx, now time.Time, n *store.Network, sc 
 			if e.Dormant.IsZero() {
 				e.Dormant = now
 				if err := tx.PutEdge(e); err != nil {
-					return err
+					return holdings{}, err
 				}
 			}
 		default:
 			if err := releasePorts(tx, e, now); err != nil {
-				return err
+				return holdings{}, err
 			}
 			if err := tx.DeleteEdge(n.ID, e.A, e.B); err != nil {
-				return err
+				return holdings{}, err
 			}
+			h.edgesAfter--
 			touched = append(touched, relayIDs(e)...)
 		}
 	}
@@ -215,7 +226,7 @@ func (p *Plane) reconcileEdges(tx store.Tx, now time.Time, n *store.Network, sc 
 	for _, id := range n.Relays {
 		r, err := tx.Relay(id)
 		if err != nil {
-			return notFound(err, "relay "+string(id))
+			return holdings{}, notFound(err, "relay "+string(id))
 		}
 		relays = append(relays, r)
 	}
@@ -228,24 +239,25 @@ func (p *Plane) reconcileEdges(tx store.Tx, now time.Time, n *store.Network, sc 
 		}
 		e := store.Edge{Network: n.ID, A: key[0], B: key[1], Created: now}
 		if e.SecretAB, err = model.NewSecret(p.Rand); err != nil {
-			return err
+			return holdings{}, err
 		}
 		if e.SecretBA, err = model.NewSecret(p.Rand); err != nil {
-			return err
+			return holdings{}, err
 		}
 		for _, r := range relays {
 			ports, err := p.allocPorts(tx, r, now)
 			if err != nil {
-				return err
+				return holdings{}, err
 			}
 			e.Ports = append(e.Ports, ports)
 		}
 		if err := tx.PutEdge(e); err != nil {
-			return err
+			return holdings{}, err
 		}
+		h.edgesAfter++
 		touched = append(touched, relayIDs(e)...)
 	}
-	return bumpRelays(tx, touched)
+	return h, bumpRelays(tx, touched)
 }
 
 // expireDormant deletes edges dormant for a port quarantine. Their ports

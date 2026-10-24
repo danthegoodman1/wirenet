@@ -301,6 +301,26 @@ A runtime attaches a workload through the agent's socket, `/run/wirenet/agent.so
 - **Revoke an interface:** `wirenetctl interface revoke IFACE` removes its key from every peer, with no grace period.
 - **Restart an agent:** traffic continues, since the kernel holds the data plane, and DNS queries wait in the socket buffer under systemd. The agent adopts its interfaces from its journal and the kernel.
 
+### Tenants
+
+A token is global or scoped to a set of networks. The operator's token is the one global admin; it issues admin tokens for a tenant's networks, and a host can be scoped to the networks it may attach into:
+
+```console
+wirenetctl network create shop --relays r1,r2 --interfaces 200 --edges 2000
+wirenetctl admin create shop-admin --network shop > shop-admin.json      # the tenant's token
+WIRENET_ADMIN_TOKEN=$(jq -r .token shop-admin.json) wirenetctl host create shop-vm --network shop > host.json
+```
+
+| Arrangement | Admin token | Host tokens |
+|---|---|---|
+| The tenant manages its networks on the operator's shared hosts | scoped | global, on hosts the operator runs |
+| The tenant runs its own hosts and workloads too | scoped | scoped, on the tenant's hosts |
+| The operator runs everything | global | global |
+
+An admin token manages its networks' services, rules, interfaces and development machines, and hosts scoped within them. A network, interface or host outside its scope answers `not_found`. Only the operator creates networks, sets quotas, registers global hosts, and widens internet egress; an admin token may only narrow it. `wirenetctl host scope HOST --network NET` rescopes a host: it revokes the host's interfaces in the networks it loses, and the host's poll drops those networks at once.
+
+A quota bounds a network's live interfaces, services, rules and edges; each edge holds two ports on every relay of the network's set, which every network on that relay shares. `wirenetctl quota show NET` reads it against what the network holds, and `--quota-*` on `wirenet-cp` sets the default for each bound a network's creation leaves out. Each scoped host and admin token may make 10 writes a second, bursting to 50, with 16 calls in flight on each replica (`--scoped-rate`, `--scoped-burst`, `--scoped-in-flight`); a refused call answers 429, which `cpclient` and the agent retry.
+
 ### Monitoring
 
 Each daemon serves `/metrics`, `/healthz` and `/readyz` on its `--telemetry` address: `:9090` for the control plane, `:9091` for an agent, `:9092` for a relay. `deploy/monitoring` has a Prometheus config and a Grafana dashboard.
@@ -342,7 +362,8 @@ Relaying ciphertext is common: Tailscale's DERP, Nebula's relays and NetBird all
 - **Not a lock.** A service that needs a single writer fences in its storage layer.
 - **Rules name one service or every service.** Selecting services by label is planned, and would follow the same rule for a service's own members.
 - **Relays are trusted for availability.** A relay can drop or misdeliver packets, though it can never read or forge them.
-- **A host's token admits it to every network.** A compromised host speaks only as the interfaces it holds, but can attach new ones to any service.
+- **A global host's token admits it to every network.** A compromised host speaks only as the interfaces it holds, but can attach new ones to any service its scope admits. Scope every host that someone other than the operator controls.
+- **Names are unique fleet-wide.** A tenant that registers a host under a taken name learns the name exists.
 - **One control plane orders every change.** Every write takes the next revision from one row, so attaches, releases and policy changes serialize across networks.
 - **The relay's socket model caps its edges.** One socket per directed port; the next step is XDP or TC.
 - **A partition keeps an island alive.** A revoked interface cut off together with some of its clients keeps serving them until the partition heals.

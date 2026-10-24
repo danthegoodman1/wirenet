@@ -12,7 +12,8 @@ import (
 	"github.com/danthegoodman1/wirenet/internal/store"
 )
 
-// The operator's API.
+// The admin API. Every handler reads its caller's scope in the transaction
+// it acts in: a network, interface or host outside it reads as absent.
 
 func (s *Server) createNetwork(r *http.Request, _ principal) (any, error) {
 	req, err := decode[api.CreateNetwork](r)
@@ -30,23 +31,29 @@ func (s *Server) createNetwork(r *http.Request, _ principal) (any, error) {
 	return networkInfo(n), nil
 }
 
-func (s *Server) listNetworks(r *http.Request, _ principal) (any, error) {
+func (s *Server) listNetworks(r *http.Request, p principal) (any, error) {
 	var out []api.Network
 	err := s.view(r.Context(), "list_networks", func(tx store.ReadTx) error {
+		by, err := scopeOf(tx, p)
+		if err != nil {
+			return err
+		}
 		nets, err := tx.Networks()
 		out = make([]api.Network, 0, len(nets))
 		for _, n := range nets {
-			out = append(out, networkInfo(n))
+			if by.Admits(n.ID) {
+				out = append(out, networkInfo(n))
+			}
 		}
 		return err
 	})
 	return out, err
 }
 
-func (s *Server) getNetwork(r *http.Request, _ principal) (any, error) {
+func (s *Server) getNetwork(r *http.Request, p principal) (any, error) {
 	var out api.Network
 	err := s.view(r.Context(), "get_network", func(tx store.ReadTx) error {
-		n, err := cp.ResolveNetwork(tx, r.PathValue("net"))
+		n, err := network(tx, p, r.PathValue("net"))
 		out = networkInfo(n)
 		return err
 	})
@@ -63,14 +70,49 @@ func (s *Server) deleteNetwork(r *http.Request, _ principal) (any, error) {
 	return nil, err
 }
 
-func (s *Server) createService(r *http.Request, _ principal) (any, error) {
+func (s *Server) getQuota(r *http.Request, p principal) (any, error) {
+	var out api.QuotaInfo
+	err := s.view(r.Context(), "get_quota", func(tx store.ReadTx) error {
+		n, err := network(tx, p, r.PathValue("net"))
+		if err != nil {
+			return err
+		}
+		out.Quota = n.Quota
+		out.Usage, err = cp.Usage(tx, n)
+		return err
+	})
+	return out, err
+}
+
+func (s *Server) setQuota(r *http.Request, _ principal) (any, error) {
+	req, err := decode[api.Quota](r)
+	if err != nil {
+		return nil, err
+	}
+	var n store.Network
+	if _, err := s.update(r.Context(), "set_quota", func(tx store.Tx) error {
+		n, err = s.plane.SetQuota(tx, r.PathValue("net"), req)
+		return err
+	}); err != nil {
+		return nil, err
+	}
+	s.log.Info().Str("network", string(n.ID)).Int("interfaces", n.Quota.Interfaces).Int("services", n.Quota.Services).
+		Int("rules", n.Quota.Rules).Int("edges", n.Quota.Edges).Msg("quota set")
+	return networkInfo(n), nil
+}
+
+func (s *Server) createService(r *http.Request, p principal) (any, error) {
 	req, err := decode[api.CreateService](r)
 	if err != nil {
 		return nil, err
 	}
 	var svc store.Service
 	if _, err := s.update(r.Context(), "create_service", func(tx store.Tx) error {
-		svc, err = s.plane.CreateService(tx, s.now(), r.PathValue("net"), req)
+		by, err := scopeOf(tx, p)
+		if err != nil {
+			return err
+		}
+		svc, err = s.plane.CreateService(tx, s.now(), by, r.PathValue("net"), req)
 		return err
 	}); err != nil {
 		return nil, err
@@ -80,10 +122,10 @@ func (s *Server) createService(r *http.Request, _ principal) (any, error) {
 	return serviceInfo(svc), nil
 }
 
-func (s *Server) listServices(r *http.Request, _ principal) (any, error) {
+func (s *Server) listServices(r *http.Request, p principal) (any, error) {
 	var out []api.ServiceInfo
 	err := s.view(r.Context(), "list_services", func(tx store.ReadTx) error {
-		n, err := cp.ResolveNetwork(tx, r.PathValue("net"))
+		n, err := network(tx, p, r.PathValue("net"))
 		if err != nil {
 			return err
 		}
@@ -97,9 +139,13 @@ func (s *Server) listServices(r *http.Request, _ principal) (any, error) {
 	return out, err
 }
 
-func (s *Server) deleteService(r *http.Request, _ principal) (any, error) {
+func (s *Server) deleteService(r *http.Request, p principal) (any, error) {
 	_, err := s.update(r.Context(), "delete_service", func(tx store.Tx) error {
-		return s.plane.DeleteService(tx, s.now(), r.PathValue("net"), r.PathValue("svc"))
+		by, err := scopeOf(tx, p)
+		if err != nil {
+			return err
+		}
+		return s.plane.DeleteService(tx, s.now(), by, r.PathValue("net"), r.PathValue("svc"))
 	})
 	if err == nil {
 		s.log.Info().Str("network", r.PathValue("net")).Str("service", r.PathValue("svc")).Msg("service deleted")
@@ -107,14 +153,18 @@ func (s *Server) deleteService(r *http.Request, _ principal) (any, error) {
 	return nil, err
 }
 
-func (s *Server) createRule(r *http.Request, _ principal) (any, error) {
+func (s *Server) createRule(r *http.Request, p principal) (any, error) {
 	req, err := decode[api.CreateRule](r)
 	if err != nil {
 		return nil, err
 	}
 	var rule store.Rule
 	if _, err := s.update(r.Context(), "create_rule", func(tx store.Tx) error {
-		rule, err = s.plane.CreateRule(tx, s.now(), r.PathValue("net"), req)
+		by, err := scopeOf(tx, p)
+		if err != nil {
+			return err
+		}
+		rule, err = s.plane.CreateRule(tx, s.now(), by, r.PathValue("net"), req)
 		return err
 	}); err != nil {
 		return nil, err
@@ -127,10 +177,10 @@ func (s *Server) createRule(r *http.Request, _ principal) (any, error) {
 
 // policy lists the flows a network's rules leave open, resolved as its
 // hosts receive them.
-func (s *Server) policy(r *http.Request, _ principal) (any, error) {
+func (s *Server) policy(r *http.Request, p principal) (any, error) {
 	var out []api.Grant
 	err := s.view(r.Context(), "policy", func(tx store.ReadTx) error {
-		n, err := cp.ResolveNetwork(tx, r.PathValue("net"))
+		n, err := network(tx, p, r.PathValue("net"))
 		if err != nil {
 			return err
 		}
@@ -155,10 +205,10 @@ func (s *Server) policy(r *http.Request, _ principal) (any, error) {
 	return out, err
 }
 
-func (s *Server) listRules(r *http.Request, _ principal) (any, error) {
+func (s *Server) listRules(r *http.Request, p principal) (any, error) {
 	var out []api.Rule
 	err := s.view(r.Context(), "list_rules", func(tx store.ReadTx) error {
-		n, err := cp.ResolveNetwork(tx, r.PathValue("net"))
+		n, err := network(tx, p, r.PathValue("net"))
 		if err != nil {
 			return err
 		}
@@ -172,9 +222,13 @@ func (s *Server) listRules(r *http.Request, _ principal) (any, error) {
 	return out, err
 }
 
-func (s *Server) deleteRule(r *http.Request, _ principal) (any, error) {
+func (s *Server) deleteRule(r *http.Request, p principal) (any, error) {
 	_, err := s.update(r.Context(), "delete_rule", func(tx store.Tx) error {
-		return s.plane.DeleteRule(tx, s.now(), r.PathValue("net"), model.RuleID(r.PathValue("rule")))
+		by, err := scopeOf(tx, p)
+		if err != nil {
+			return err
+		}
+		return s.plane.DeleteRule(tx, s.now(), by, r.PathValue("net"), model.RuleID(r.PathValue("rule")))
 	})
 	if err == nil {
 		s.log.Info().Str("network", r.PathValue("net")).Str("rule", r.PathValue("rule")).Msg("rule deleted")
@@ -182,10 +236,10 @@ func (s *Server) deleteRule(r *http.Request, _ principal) (any, error) {
 	return nil, err
 }
 
-func (s *Server) listInterfaces(r *http.Request, _ principal) (any, error) {
+func (s *Server) listInterfaces(r *http.Request, p principal) (any, error) {
 	var out []api.InterfaceInfo
 	err := s.view(r.Context(), "list_interfaces", func(tx store.ReadTx) error {
-		n, err := cp.ResolveNetwork(tx, r.PathValue("net"))
+		n, err := network(tx, p, r.PathValue("net"))
 		if err != nil {
 			return err
 		}
@@ -199,7 +253,7 @@ func (s *Server) listInterfaces(r *http.Request, _ principal) (any, error) {
 	return out, err
 }
 
-func (s *Server) createDevice(r *http.Request, _ principal) (any, error) {
+func (s *Server) createDevice(r *http.Request, p principal) (any, error) {
 	req, err := decode[api.CreateDevice](r)
 	if err != nil {
 		return nil, err
@@ -207,7 +261,11 @@ func (s *Server) createDevice(r *http.Request, _ principal) (any, error) {
 	var d store.Interface
 	var cfg api.DeviceConfig
 	if _, err := s.update(r.Context(), "create_device", func(tx store.Tx) error {
-		if d, err = s.plane.CreateDevice(tx, s.now(), r.PathValue("net"), req); err != nil {
+		by, err := scopeOf(tx, p)
+		if err != nil {
+			return err
+		}
+		if d, err = s.plane.CreateDevice(tx, s.now(), by, r.PathValue("net"), req); err != nil {
 			return err
 		}
 		cfg, err = cp.DeviceConfig(tx, d.ID)
@@ -221,9 +279,15 @@ func (s *Server) createDevice(r *http.Request, _ principal) (any, error) {
 	return cfg, nil
 }
 
-func (s *Server) revoke(r *http.Request, _ principal) (any, error) {
+func (s *Server) revoke(r *http.Request, p principal) (any, error) {
 	id := model.InterfaceID(r.PathValue("id"))
-	_, err := s.update(r.Context(), "revoke", func(tx store.Tx) error { return s.plane.Revoke(tx, s.now(), id) })
+	_, err := s.update(r.Context(), "revoke", func(tx store.Tx) error {
+		by, err := scopeOf(tx, p)
+		if err != nil {
+			return err
+		}
+		return s.plane.RevokeIn(tx, s.now(), by, id)
+	})
 	if err == nil {
 		s.m.leaseEvents.WithLabelValues("revoked").Inc()
 		s.log.Info().Str("interface", string(id)).Msg("interface revoked")
@@ -231,7 +295,7 @@ func (s *Server) revoke(r *http.Request, _ principal) (any, error) {
 	return nil, err
 }
 
-func (s *Server) createHost(r *http.Request, _ principal) (any, error) {
+func (s *Server) createHost(r *http.Request, p principal) (any, error) {
 	req, err := decode[api.CreateHost](r)
 	if err != nil {
 		return nil, err
@@ -239,22 +303,75 @@ func (s *Server) createHost(r *http.Request, _ principal) (any, error) {
 	var h store.Host
 	var token string
 	if _, err := s.update(r.Context(), "create_host", func(tx store.Tx) error {
-		h, token, err = s.plane.CreateHost(tx, s.now(), req)
+		by, err := scopeOf(tx, p)
+		if err != nil {
+			return err
+		}
+		h, token, err = s.plane.CreateHost(tx, s.now(), by, req)
 		return err
 	}); err != nil {
 		return nil, err
 	}
-	s.log.Info().Str("host", string(h.ID)).Str("name", h.Name).Msg("host registered")
+	s.log.Info().Str("host", string(h.ID)).Str("name", h.Name).Bool("global", h.Scope.Global).
+		Strs("networks", ids(h.Scope.Networks)).Msg("host registered")
 	return api.Credentials{ID: string(h.ID), Token: token}, nil
+}
+
+func (s *Server) listHosts(r *http.Request, p principal) (any, error) {
+	var out []api.HostInfo
+	err := s.view(r.Context(), "list_hosts", func(tx store.ReadTx) error {
+		by, err := scopeOf(tx, p)
+		if err != nil {
+			return err
+		}
+		hosts, err := cp.HostsIn(tx, by)
+		out = make([]api.HostInfo, 0, len(hosts))
+		for _, h := range hosts {
+			out = append(out, hostInfo(h))
+		}
+		return err
+	})
+	return out, err
+}
+
+// setHostScope changes the networks a host may attach into, revoking its
+// interfaces in the networks it loses.
+func (s *Server) setHostScope(r *http.Request, p principal) (any, error) {
+	req, err := decode[api.Scope](r)
+	if err != nil {
+		return nil, err
+	}
+	var h store.Host
+	var revoked []model.InterfaceID
+	if _, err := s.update(r.Context(), "set_host_scope", func(tx store.Tx) error {
+		by, err := scopeOf(tx, p)
+		if err != nil {
+			return err
+		}
+		h, revoked, err = s.plane.SetHostScope(tx, s.now(), by, r.PathValue("host"), req)
+		return err
+	}); err != nil {
+		return nil, err
+	}
+	s.m.leaseEvents.WithLabelValues("revoked").Add(float64(len(revoked)))
+	// A host whose scope changed takes its new limits once its token is
+	// looked up again.
+	s.tokens.Delete(h.TokenHash)
+	s.log.Info().Str("host", string(h.ID)).Str("name", h.Name).Bool("global", h.Scope.Global).
+		Strs("networks", ids(h.Scope.Networks)).Strs("revoked", ids(revoked)).Msg("host scope set")
+	return hostInfo(h), nil
 }
 
 // deleteHost revokes a host's interfaces and deletes it. This replica stops
 // trusting its token at once, and every other within TokenTTL.
-func (s *Server) deleteHost(r *http.Request, _ principal) (any, error) {
+func (s *Server) deleteHost(r *http.Request, p principal) (any, error) {
 	var h store.Host
 	if _, err := s.update(r.Context(), "delete_host", func(tx store.Tx) error {
-		var err error
-		h, err = s.plane.DeleteHost(tx, s.now(), r.PathValue("host"))
+		by, err := scopeOf(tx, p)
+		if err != nil {
+			return err
+		}
+		h, err = s.plane.DeleteHost(tx, s.now(), by, r.PathValue("host"))
 		return err
 	}); err != nil {
 		return nil, err
@@ -313,6 +430,71 @@ func (s *Server) deleteRelay(r *http.Request, _ principal) (any, error) {
 	return nil, nil
 }
 
+func (s *Server) createAdmin(r *http.Request, _ principal) (any, error) {
+	req, err := decode[api.CreateAdmin](r)
+	if err != nil {
+		return nil, err
+	}
+	var a store.Admin
+	var token string
+	if _, err := s.update(r.Context(), "create_admin", func(tx store.Tx) error {
+		a, token, err = s.plane.CreateAdmin(tx, s.now(), req)
+		return err
+	}); err != nil {
+		return nil, err
+	}
+	s.log.Info().Str("admin", string(a.ID)).Str("name", a.Name).Strs("networks", ids(a.Scope.Networks)).Msg("admin token issued")
+	return api.Credentials{ID: string(a.ID), Token: token}, nil
+}
+
+func (s *Server) listAdmins(r *http.Request, _ principal) (any, error) {
+	var out []api.AdminInfo
+	err := s.view(r.Context(), "list_admins", func(tx store.ReadTx) error {
+		admins, err := tx.Admins()
+		out = make([]api.AdminInfo, 0, len(admins))
+		for _, a := range admins {
+			out = append(out, adminInfo(a))
+		}
+		return err
+	})
+	return out, err
+}
+
+func (s *Server) setAdminScope(r *http.Request, _ principal) (any, error) {
+	req, err := decode[api.Scope](r)
+	if err != nil {
+		return nil, err
+	}
+	if req.Global {
+		return nil, &api.Error{Code: api.CodeInvalid, Message: "the operator's token is the only global admin"}
+	}
+	var a store.Admin
+	if _, err := s.update(r.Context(), "set_admin_scope", func(tx store.Tx) error {
+		a, err = s.plane.SetAdminScope(tx, r.PathValue("admin"), req.Networks)
+		return err
+	}); err != nil {
+		return nil, err
+	}
+	s.log.Info().Str("admin", string(a.ID)).Str("name", a.Name).Strs("networks", ids(a.Scope.Networks)).Msg("admin scope set")
+	return adminInfo(a), nil
+}
+
+// deleteAdmin deletes an admin token, which every replica stops trusting at
+// once, since every call reads its record.
+func (s *Server) deleteAdmin(r *http.Request, _ principal) (any, error) {
+	var a store.Admin
+	if _, err := s.update(r.Context(), "delete_admin", func(tx store.Tx) error {
+		var err error
+		a, err = s.plane.DeleteAdmin(tx, r.PathValue("admin"))
+		return err
+	}); err != nil {
+		return nil, err
+	}
+	s.tokens.Delete(a.TokenHash)
+	s.log.Info().Str("admin", string(a.ID)).Str("name", a.Name).Msg("admin token deleted")
+	return nil, nil
+}
+
 // The agents' API.
 
 func (s *Server) attach(r *http.Request, p principal) (any, error) {
@@ -335,11 +517,8 @@ func (s *Server) attach(r *http.Request, p principal) (any, error) {
 	// The answer is read after the commit, so it carries the revision the
 	// attach made.
 	if err := s.view(r.Context(), "attach_state", func(tx store.ReadTx) error {
-		iface, err := tx.Interface(resp.Interface)
-		if err != nil {
-			return err
-		}
-		resp.State, err = cp.NetworkStateFor(tx, s.cache, iface.Network, p.host)
+		var err error
+		resp.State, err = cp.AttachState(tx, s.cache, resp.Interface, p.host)
 		return err
 	}); err != nil {
 		return nil, err
@@ -512,7 +691,7 @@ func sameNets(a, b []model.NetworkID) bool {
 	return true
 }
 
-func ids(in []model.InterfaceID) []string {
+func ids[T ~string](in []T) []string {
 	out := make([]string, len(in))
 	for i, id := range in {
 		out[i] = string(id)
@@ -521,7 +700,22 @@ func ids(in []model.InterfaceID) []string {
 }
 
 func networkInfo(n store.Network) api.Network {
-	return api.Network{ID: n.ID, Name: n.Name, Prefix6: n.Prefix6, Prefix4: n.Prefix4, MTU: n.MTU, Relays: n.Relays, Revision: n.Revision, Changed: n.Changed}
+	return api.Network{
+		ID: n.ID, Name: n.Name, Prefix6: n.Prefix6, Prefix4: n.Prefix4, MTU: n.MTU, Relays: n.Relays,
+		Revision: n.Revision, Changed: n.Changed, Quota: n.Quota,
+	}
+}
+
+func scopeInfo(sc store.Scope) api.Scope {
+	return api.Scope{Global: sc.Global, Networks: ids(sc.Networks)}
+}
+
+func hostInfo(h store.Host) api.HostInfo {
+	return api.HostInfo{ID: h.ID, Name: h.Name, Endpoint: h.Endpoint, Scope: scopeInfo(h.Scope), Created: h.Created}
+}
+
+func adminInfo(a store.Admin) api.AdminInfo {
+	return api.AdminInfo{ID: a.ID, Name: a.Name, Scope: scopeInfo(a.Scope), Created: a.Created}
 }
 
 func serviceInfo(s store.Service) api.ServiceInfo {

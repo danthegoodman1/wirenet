@@ -48,6 +48,13 @@ func run() error {
 	flag.IntVar(&cfg.Plane.MTU, "mtu", cfg.Plane.MTU, "overlay MTU for networks that name none")
 	flag.DurationVar(&cfg.PollTimeout, "poll-timeout", cfg.PollTimeout, "how long a long poll parks")
 	flag.DurationVar(&cfg.CensusEvery, "census-every", cfg.CensusEvery, "how often to count interfaces, IPv4 quarantine and relay ports for metrics")
+	flag.IntVar(&cfg.Plane.Quota.Interfaces, "quota-interfaces", 0, "the most live interfaces a network holds unless it names a quota; 0 for no bound")
+	flag.IntVar(&cfg.Plane.Quota.Services, "quota-services", 0, "the most services a network holds unless it names a quota; 0 for no bound")
+	flag.IntVar(&cfg.Plane.Quota.Rules, "quota-rules", 0, "the most rules a network holds unless it names a quota; 0 for no bound")
+	flag.IntVar(&cfg.Plane.Quota.Edges, "quota-edges", 0, "the most edges a network holds unless it names a quota; 0 for no bound")
+	flag.Float64Var(&cfg.Limits.Rate, "scoped-rate", cfg.Limits.Rate, "writes a second each scoped host or admin token may make on this replica; 0 for no bound")
+	flag.IntVar(&cfg.Limits.Burst, "scoped-burst", cfg.Limits.Burst, "writes a scoped host or admin token may make at once")
+	flag.IntVar(&cfg.Limits.InFlight, "scoped-in-flight", cfg.Limits.InFlight, "calls a scoped host or admin token may have running on this replica, long polls included; 0 for no bound")
 	flag.Parse()
 
 	log, err := telemetry.NewLogger("cp", telemetry.LogConfig{Level: *logLevel, Format: *logFormat})
