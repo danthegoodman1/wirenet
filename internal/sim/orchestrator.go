@@ -11,6 +11,7 @@ import (
 
 	agentcore "github.com/danthegoodman1/wirenet/internal/agent/core"
 	"github.com/danthegoodman1/wirenet/internal/api"
+	"github.com/danthegoodman1/wirenet/internal/cp"
 	"github.com/danthegoodman1/wirenet/internal/kernel/kmodel"
 	"github.com/danthegoodman1/wirenet/internal/model"
 	"github.com/danthegoodman1/wirenet/internal/prng"
@@ -68,13 +69,15 @@ type orchestrator struct {
 	w   *World
 	rng *prng.Rand
 	// egress draws internet grants, on a stream of its own so the other
-	// draws stay as they were; policy draws wildcard and deny rules, and
-	// unnamer which namespace loses its name, and member which workloads
-	// hold member names, likewise.
+	// draws stay as they were; policy draws wildcard and deny rules,
+	// unnamer which namespace loses its name, member which workloads hold
+	// member names, and scope which networks a host may attach into,
+	// likewise.
 	egress    *prng.Rand
 	policy    *prng.Rand
 	unnamer   *prng.Rand
 	member    *prng.Rand
+	scope     *prng.Rand
 	networks  []*netIntent
 	ifaces    map[model.InterfaceID]*ifIntent
 	attaching map[string]*pendingAttach
@@ -104,7 +107,7 @@ const retryAfter = 500 * time.Millisecond
 func newOrchestrator(w *World) *orchestrator {
 	return &orchestrator{
 		w: w, rng: prng.Stream(w.seed, "orchestrator"), egress: prng.Stream(w.seed, "egress"), policy: prng.Stream(w.seed, "policy"),
-		unnamer: prng.Stream(w.seed, "unname"), member: prng.Stream(w.seed, "member"),
+		unnamer: prng.Stream(w.seed, "unname"), member: prng.Stream(w.seed, "member"), scope: prng.Stream(w.seed, "scope"),
 		ifaces: map[model.InterfaceID]*ifIntent{}, attaching: map[string]*pendingAttach{},
 		requested: map[model.InterfaceID]string{},
 	}
@@ -131,7 +134,7 @@ func (o *orchestrator) setup() {
 	}
 	for _, h := range w.hosts {
 		o.admin(func(tx store.Tx) error {
-			rec, _, err := w.cp.plane.CreateHost(tx, now, api.CreateHost{Name: h.name})
+			rec, _, err := w.cp.plane.CreateHost(tx, now, cp.Global(), api.CreateHost{Name: h.name})
 			h.id = rec.ID
 			return err
 		})
@@ -164,7 +167,7 @@ func (o *orchestrator) setup() {
 				mode = api.Cutover
 			}
 			o.admin(func(tx store.Tx) error {
-				rec, err := w.cp.plane.CreateService(tx, now, string(n.id), api.CreateService{Name: s.name, IPv4: s.ipv4, Mode: mode})
+				rec, err := w.cp.plane.CreateService(tx, now, cp.Global(), string(n.id), api.CreateService{Name: s.name, IPv4: s.ipv4, Mode: mode})
 				s.id, s.addr6, s.addr4 = rec.ID, rec.Addr6, rec.Addr4
 				return err
 			})
@@ -209,7 +212,7 @@ func (o *orchestrator) grantEgress() {
 	}
 	if len(grants) > 0 && o.egress.Percent(40) {
 		id := grants[o.egress.Index(len(grants))]
-		if o.admin(func(tx store.Tx) error { return o.w.cp.plane.DeleteRule(tx, o.w.now(), string(n.id), id) }) {
+		if o.admin(func(tx store.Tx) error { return o.w.cp.plane.DeleteRule(tx, o.w.now(), cp.Global(), string(n.id), id) }) {
 			delete(n.rules, id)
 			o.record(n)
 		}
@@ -223,7 +226,7 @@ func (o *orchestrator) grantEgress() {
 	var r store.Rule
 	if o.admin(func(tx store.Tx) error {
 		var err error
-		r, err = o.w.cp.plane.CreateRule(tx, o.w.now(), string(n.id), api.CreateRule{From: string(s.id), To: api.Internet, Proto: proto, Ports: ports})
+		r, err = o.w.cp.plane.CreateRule(tx, o.w.now(), cp.Global(), string(n.id), api.CreateRule{From: string(s.id), To: api.Internet, Proto: proto, Ports: ports})
 		return err
 	}) {
 		n.rules[r.ID] = r
@@ -247,7 +250,7 @@ func (o *orchestrator) changePolicy() {
 	}
 	if len(drawn) > 0 && o.policy.Percent(40) {
 		id := drawn[o.policy.Index(len(drawn))]
-		if o.admin(func(tx store.Tx) error { return o.w.cp.plane.DeleteRule(tx, o.w.now(), string(n.id), id) }) {
+		if o.admin(func(tx store.Tx) error { return o.w.cp.plane.DeleteRule(tx, o.w.now(), cp.Global(), string(n.id), id) }) {
 			delete(n.rules, id)
 			o.w.summary.Policies++
 			o.record(n)
@@ -290,7 +293,7 @@ func (o *orchestrator) changePolicy() {
 	var r store.Rule
 	if o.admin(func(tx store.Tx) error {
 		var err error
-		r, err = o.w.cp.plane.CreateRule(tx, o.w.now(), string(n.id), req)
+		r, err = o.w.cp.plane.CreateRule(tx, o.w.now(), cp.Global(), string(n.id), req)
 		return err
 	}) {
 		n.rules[r.ID] = r
@@ -304,7 +307,7 @@ func (o *orchestrator) addRule(n *netIntent, a, b *svcIntent) {
 	var r store.Rule
 	if o.admin(func(tx store.Tx) error {
 		var err error
-		r, err = o.w.cp.plane.CreateRule(tx, o.w.now(), string(n.id), api.CreateRule{From: string(a.id), To: string(b.id), Proto: proto, Ports: ports})
+		r, err = o.w.cp.plane.CreateRule(tx, o.w.now(), cp.Global(), string(n.id), api.CreateRule{From: string(a.id), To: string(b.id), Proto: proto, Ports: ports})
 		return err
 	}) {
 		n.rules[r.ID] = r
@@ -369,6 +372,7 @@ func (o *orchestrator) start() {
 		o.grantEgress()
 		o.changePolicy()
 		o.attachMember()
+		o.changeScope()
 		o.w.loop.After(o.rng.Duration(o.w.opts.ChangeEvery/4, o.w.opts.ChangeEvery*2), next)
 	}
 	o.w.loop.After(o.w.opts.ChangeEvery, next)
@@ -411,7 +415,7 @@ func (o *orchestrator) change() {
 			return
 		}
 		id := ids[o.rng.Index(len(ids))]
-		if o.admin(func(tx store.Tx) error { return o.w.cp.plane.DeleteRule(tx, o.w.now(), string(n.id), id) }) {
+		if o.admin(func(tx store.Tx) error { return o.w.cp.plane.DeleteRule(tx, o.w.now(), cp.Global(), string(n.id), id) }) {
 			delete(n.rules, id)
 			o.w.summary.Rules++
 			o.record(n)
@@ -567,6 +571,32 @@ func (o *orchestrator) unname(h *hostNode) {
 	ns := x.held
 	x.held = nil
 	o.w.loop.After(o.unnamer.Duration(time.Second, 20*time.Second), func() { h.kernel.Unhold(ns) })
+}
+
+// changeScope sometimes changes which networks a host may attach into, as
+// an operator handing a host to a tenant would: every network, a subset, or
+// none. The host's interfaces in the networks it loses are revoked, and the
+// orchestrator's attaches outside its scope are refused.
+func (o *orchestrator) changeScope() {
+	if !o.scope.Percent(5) {
+		return
+	}
+	h := o.w.hosts[o.scope.Index(len(o.w.hosts))]
+	sc := api.Scope{Global: o.scope.Percent(40)}
+	if !sc.Global {
+		for _, n := range o.networks {
+			if o.scope.Percent(60) {
+				sc.Networks = append(sc.Networks, n.name)
+			}
+		}
+	}
+	if o.admin(func(tx store.Tx) error {
+		_, _, err := o.w.cp.plane.SetHostScope(tx, o.w.now(), cp.Global(), h.name, sc)
+		return err
+	}) {
+		o.w.summary.Rescopes++
+		o.w.logf("host %s scoped to %+v", h.name, sc)
+	}
 }
 
 func (o *orchestrator) revoke(x *ifIntent) {

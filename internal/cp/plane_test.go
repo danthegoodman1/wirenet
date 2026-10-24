@@ -23,7 +23,7 @@ import (
 var t0 = time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
 
 type fixture struct {
-	t      *testing.T
+	t      testing.TB
 	s      store.Store
 	p      *Plane
 	now    time.Time
@@ -32,7 +32,7 @@ type fixture struct {
 	relays []string
 }
 
-func newFixture(t *testing.T, s store.Store) *fixture {
+func newFixture(t testing.TB, s store.Store) *fixture {
 	cfg := DefaultConfig()
 	return &fixture{
 		t: t, s: s, now: t0, rng: prng.New(1),
@@ -95,7 +95,7 @@ func (f *fixture) service(net, name string, ipv4 bool) store.Service {
 	var s store.Service
 	f.update(func(tx store.Tx) error {
 		var err error
-		s, err = f.p.CreateService(tx, f.now, net, api.CreateService{Name: name, IPv4: ipv4})
+		s, err = f.p.CreateService(tx, f.now, Global(), net, api.CreateService{Name: name, IPv4: ipv4})
 		return err
 	})
 	return s
@@ -105,7 +105,7 @@ func (f *fixture) rule(net, from, to string, proto model.Proto, port uint16) sto
 	var r store.Rule
 	f.update(func(tx store.Tx) error {
 		var err error
-		r, err = f.p.CreateRule(tx, f.now, net, api.CreateRule{From: from, To: to, Proto: proto, Ports: model.PortRange{Lo: port, Hi: port}})
+		r, err = f.p.CreateRule(tx, f.now, Global(), net, api.CreateRule{From: from, To: to, Proto: proto, Ports: model.PortRange{Lo: port, Hi: port}})
 		return err
 	})
 	return r
@@ -116,7 +116,7 @@ func (f *fixture) host(name string) model.HostID {
 		return id
 	}
 	f.update(func(tx store.Tx) error {
-		h, _, err := f.p.CreateHost(tx, f.now, api.CreateHost{Name: name})
+		h, _, err := f.p.CreateHost(tx, f.now, Global(), api.CreateHost{Name: name})
 		f.hosts[name] = h.ID
 		return err
 	})
@@ -560,7 +560,7 @@ func TestADisconnectedPairKeepsItsEdgeForTheQuarantine(t *testing.T) {
 			return out
 		}
 		before := edges()
-		f.update(func(tx store.Tx) error { return f.p.DeleteRule(tx, f.now, "n", r.ID) })
+		f.update(func(tx store.Tx) error { return f.p.DeleteRule(tx, f.now, Global(), "n", r.ID) })
 		dormant := edges()
 		if len(dormant) != 1 || dormant[0].Dormant.IsZero() {
 			t.Fatalf("edges after the rule went: %+v", dormant)
@@ -593,7 +593,7 @@ func TestADisconnectedPairKeepsItsEdgeForTheQuarantine(t *testing.T) {
 		r2 := after[0]
 		var rules []store.Rule
 		f.s.View(context.Background(), func(tx store.ReadTx) error { rules, _ = tx.Rules(r2.Network); return nil })
-		f.update(func(tx store.Tx) error { return f.p.DeleteRule(tx, f.now, "n", rules[0].ID) })
+		f.update(func(tx store.Tx) error { return f.p.DeleteRule(tx, f.now, Global(), "n", rules[0].ID) })
 		f.update(func(tx store.Tx) error {
 			_, err := f.p.Sweep(tx, f.now.Add(f.p.Config.PortQuarantine-time.Second))
 			return err
@@ -847,7 +847,7 @@ func TestDeletingAHostRevokesItsInterfaces(t *testing.T) {
 		var h store.Host
 		f.update(func(tx store.Tx) error {
 			var err error
-			h, err = f.p.DeleteHost(tx, f.now, "edge")
+			h, err = f.p.DeleteHost(tx, f.now, Global(), "edge")
 			return err
 		})
 		if got := peerIDs(f.state("h2"), db.ID); len(got) != 0 {
@@ -869,7 +869,7 @@ func TestDeletingAHostRevokesItsInterfaces(t *testing.T) {
 		}
 		f.now = f.now.Add(f.p.Config.Retention + f.p.Config.PortQuarantine)
 		f.sweep(f.now)
-		err = f.tryUpdate(func(tx store.Tx) error { _, err := f.p.DeleteHost(tx, f.now, string(h.ID)); return err })
+		err = f.tryUpdate(func(tx store.Tx) error { _, err := f.p.DeleteHost(tx, f.now, Global(), string(h.ID)); return err })
 		if code(err) != api.CodeNotFound {
 			t.Fatalf("deleting the host again: %v", err)
 		}
@@ -1019,14 +1019,22 @@ func TestStoreErrorsComeBackAsErrors(t *testing.T) {
 			call func(tx store.Tx) error
 		}{
 			{"DeleteRule", func(tx store.Tx) error {
-				return f.p.DeleteRule(brokenTx{tx, "Rule"}, f.now, "shop", rule.ID)
+				return f.p.DeleteRule(brokenTx{tx, "Rule"}, f.now, Global(), "shop", rule.ID)
+			}},
+			{"RevokeIn", func(tx store.Tx) error {
+				var shop store.Network
+				shop, err := tx.NetworkByName("shop")
+				if err != nil {
+					return err
+				}
+				return f.p.RevokeIn(brokenTx{tx, "Interface"}, f.now, store.Scope{Networks: []model.NetworkID{shop.ID}}, laptop.ID)
 			}},
 			{"DeviceConfig", func(tx store.Tx) error {
 				_, err := DeviceConfig(brokenTx{tx, "Interface"}, laptop.ID)
 				return err
 			}},
 			{"CreateDevice", func(tx store.Tx) error {
-				_, err := f.p.CreateDevice(brokenTx{tx, "Host"}, f.now, "shop", api.CreateDevice{
+				_, err := f.p.CreateDevice(brokenTx{tx, "Host"}, f.now, Global(), "shop", api.CreateDevice{
 					Service: "dev", Gateway: gw.ID, PublicKey: model.Key{9}, TTL: time.Hour,
 				})
 				return err

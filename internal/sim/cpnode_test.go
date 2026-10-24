@@ -17,7 +17,7 @@ func TestAParkedPollWakesForItsNetwork(t *testing.T) {
 	c := newCP(w)
 	var host model.HostID
 	if _, err := c.update(func(tx store.Tx) error {
-		h, _, err := c.plane.CreateHost(tx, w.now(), api.CreateHost{Name: "h"})
+		h, _, err := c.plane.CreateHost(tx, w.now(), cp.Global(), api.CreateHost{Name: "h"})
 		if err != nil {
 			return err
 		}
@@ -26,7 +26,7 @@ func TestAParkedPollWakesForItsNetwork(t *testing.T) {
 			return err
 		}
 		for _, svc := range []string{"a", "b"} {
-			if _, err := c.plane.CreateService(tx, w.now(), "n", api.CreateService{Name: svc}); err != nil {
+			if _, err := c.plane.CreateService(tx, w.now(), cp.Global(), "n", api.CreateService{Name: svc}); err != nil {
 				return err
 			}
 		}
@@ -48,7 +48,7 @@ func TestAParkedPollWakesForItsNetwork(t *testing.T) {
 		t.Fatal("a poll with nothing new answered at once")
 	}
 	if _, err := c.update(func(tx store.Tx) error {
-		_, err := c.plane.CreateRule(tx, w.now(), "n", api.CreateRule{From: "a", To: "b", Proto: model.TCP, Ports: model.PortRange{Lo: 1, Hi: 1}})
+		_, err := c.plane.CreateRule(tx, w.now(), cp.Global(), "n", api.CreateRule{From: "a", To: "b", Proto: model.TCP, Ports: model.PortRange{Lo: 1, Hi: 1}})
 		return err
 	}); err != nil {
 		t.Fatal(err)

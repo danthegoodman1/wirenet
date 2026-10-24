@@ -22,9 +22,9 @@ var (
 	// ErrNotFound reports a lookup that matched no record.
 	ErrNotFound = errors.New("not found")
 	// ErrConflict reports a put that would break a uniqueness rule: two
-	// networks, hosts or relays with one name, two services with one name
-	// in a network, or two live interfaces holding one member name of a
-	// service.
+	// networks, hosts, relays or admins with one name, two services with
+	// one name in a network, or two live interfaces holding one member name
+	// of a service.
 	ErrConflict = errors.New("conflict")
 )
 
@@ -110,6 +110,12 @@ type ReadTx interface {
 	Host(model.HostID) (Host, error)
 	HostByName(name string) (Host, error)
 	HostByToken(hash [32]byte) (Host, error)
+	Hosts() ([]Host, error)
+
+	Admin(model.AdminID) (Admin, error)
+	AdminByName(name string) (Admin, error)
+	AdminByToken(hash [32]byte) (Admin, error)
+	Admins() ([]Admin, error)
 
 	Relay(model.RelayID) (Relay, error)
 	RelayByName(name string) (Relay, error)
@@ -151,6 +157,9 @@ type Tx interface {
 	// DeleteRelay removes a relay, its port cursors and its released
 	// ports.
 	DeleteRelay(model.RelayID) error
+	PutAdmin(Admin) error
+	// DeleteAdmin removes an admin, and with it its token.
+	DeleteAdmin(model.AdminID) error
 
 	PutReleased4(Released4) error
 	DeleteReleased4(net model.NetworkID, addr netip.Addr) error
@@ -185,6 +194,8 @@ type Network struct {
 	// Changed is when the revision last moved: the commit time agents
 	// measure convergence from.
 	Changed time.Time `json:"changed,omitzero"`
+	// Quota bounds what the network may hold.
+	Quota api.Quota `json:"quota,omitzero"`
 }
 
 // Service is a stable name and address in a network.
@@ -269,16 +280,72 @@ type EdgePorts struct {
 	BA   uint16     `json:"ba"`
 }
 
+// Scope is the networks a token admits: every network, or those listed. A
+// list emptied by deleted networks admits none, so a scope never widens on
+// its own.
+type Scope struct {
+	Global   bool              `json:"global,omitempty"`
+	Networks []model.NetworkID `json:"networks,omitempty"`
+}
+
+// Admits reports whether the scope admits a network.
+func (s Scope) Admits(n model.NetworkID) bool {
+	return s.Global || slices.Contains(s.Networks, n)
+}
+
+// Without returns the scope with a network taken out, and whether it held
+// it. A list emptied this way is nil and admits nothing.
+func (s Scope) Without(n model.NetworkID) (Scope, bool) {
+	i := slices.Index(s.Networks, n)
+	if i < 0 {
+		return s, false
+	}
+	s.Networks = slices.Delete(slices.Clone(s.Networks), i, i+1)
+	if len(s.Networks) == 0 {
+		s.Networks = nil
+	}
+	return s, true
+}
+
+// Within reports whether every network s admits, o admits too.
+func (s Scope) Within(o Scope) bool {
+	if o.Global {
+		return true
+	}
+	if s.Global {
+		return false
+	}
+	for _, n := range s.Networks {
+		if !slices.Contains(o.Networks, n) {
+			return false
+		}
+	}
+	return true
+}
+
 // Host is a machine running an agent.
 type Host struct {
 	ID        model.HostID   `json:"id"`
 	Name      string         `json:"name"`
 	TokenHash [32]byte       `json:"token_hash"`
 	Endpoint  netip.AddrPort `json:"endpoint,omitzero"`
+	// Scope is the networks the host may attach interfaces into.
+	Scope Scope `json:"scope"`
 	// Revision is the last revision that changed which interfaces the host
 	// holds.
 	Revision uint64    `json:"revision"`
 	Created  time.Time `json:"created"`
+}
+
+// Admin is a token that manages the networks its scope admits. The
+// operator's own token is configured rather than stored, and is the only
+// global one.
+type Admin struct {
+	ID        model.AdminID `json:"id"`
+	Name      string        `json:"name"`
+	TokenHash [32]byte      `json:"token_hash"`
+	Scope     Scope         `json:"scope"`
+	Created   time.Time     `json:"created"`
 }
 
 // Relay is a ciphertext forwarder.

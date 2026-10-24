@@ -20,7 +20,7 @@ func (f *fixture) gateway(host, net, svc string) store.Interface {
 	f.t.Helper()
 	if _, ok := f.hosts[host]; !ok {
 		f.update(func(tx store.Tx) error {
-			h, _, err := f.p.CreateHost(tx, f.now, api.CreateHost{Name: host, Endpoint: edgeEndpoint})
+			h, _, err := f.p.CreateHost(tx, f.now, Global(), api.CreateHost{Name: host, Endpoint: edgeEndpoint})
 			f.hosts[host] = h.ID
 			return err
 		})
@@ -45,7 +45,7 @@ func (f *fixture) device(net, svc string, gw model.InterfaceID, ttl time.Duratio
 	var d store.Interface
 	err := f.tryUpdate(func(tx store.Tx) error {
 		var err error
-		d, err = f.p.CreateDevice(tx, f.now, net, api.CreateDevice{Service: svc, Gateway: gw, PublicKey: priv.Public(), TTL: ttl})
+		d, err = f.p.CreateDevice(tx, f.now, Global(), net, api.CreateDevice{Service: svc, Gateway: gw, PublicKey: priv.Public(), TTL: ttl})
 		return err
 	})
 	return d, err

@@ -31,7 +31,7 @@ import (
 // Config holds what a server needs beyond its store.
 type Config struct {
 	Plane cp.Config
-	// AdminToken authorizes the operator's API.
+	// AdminToken is the operator's token, the one global admin.
 	AdminToken string
 	// PollTimeout is how long a long poll parks before answering with what
 	// is current.
@@ -44,8 +44,11 @@ type Config struct {
 	CacheNetworks int
 	// TokenTTL is how long a replica trusts a token it has looked up. A
 	// host or relay deleted through another replica keeps its token
-	// working here for up to this long.
+	// working here for up to this long; an admin token stops at once,
+	// since every call reads its record.
 	TokenTTL time.Duration
+	// Limits bound each scoped principal's calls.
+	Limits Limits
 }
 
 // DefaultConfig returns production settings around an admin token.
@@ -58,6 +61,7 @@ func DefaultConfig(adminToken string) Config {
 		CensusEvery:   15 * time.Second,
 		CacheNetworks: 4096,
 		TokenTTL:      10 * time.Second,
+		Limits:        DefaultLimits(),
 	}
 }
 
@@ -85,11 +89,19 @@ type Server struct {
 	now   func() time.Time
 
 	tokens sync.Map // [32]byte -> cachedToken, positive lookups only
+	limits *limiter
 }
 
+// principal is who a call comes from: the operator, an admin token, a host
+// or a relay.
 type principal struct {
-	host  model.HostID
-	relay model.RelayID
+	operator bool
+	admin    model.AdminID
+	host     model.HostID
+	relay    model.RelayID
+	// scoped marks a principal the limits bound: an admin token, or a host
+	// whose scope was not global when its token was looked up.
+	scoped bool
 }
 
 // cachedToken is a token's principal, trusted until a time.
@@ -106,17 +118,21 @@ func New(cfg Config, st store.Store, log zerolog.Logger, reg prometheus.Register
 	if len(cfg.AdminToken) < 16 {
 		return nil, errors.New("admin token must be at least 16 characters")
 	}
+	if err := cfg.Limits.validate(); err != nil {
+		return nil, err
+	}
 	if cfg.SweepEvery <= 0 || cfg.CensusEvery <= 0 {
 		return nil, errors.New("sweep and census intervals must be positive")
 	}
 	s := &Server{
-		cfg:   cfg,
-		store: st,
-		plane: &cp.Plane{Config: cfg.Plane, Rand: rand.Reader},
-		cache: &lockedCache{lru: cp.NewLRU(cfg.CacheNetworks)},
-		hub:   newHub(),
-		log:   log,
-		now:   time.Now,
+		cfg:    cfg,
+		store:  st,
+		plane:  &cp.Plane{Config: cfg.Plane, Rand: rand.Reader},
+		cache:  &lockedCache{lru: cp.NewLRU(cfg.CacheNetworks)},
+		hub:    newHub(),
+		log:    log,
+		now:    time.Now,
+		limits: newLimiter(cfg.Limits),
 	}
 	s.m = newMetrics(reg, s.hub)
 	return s, nil
@@ -222,6 +238,7 @@ func (s *Server) census(ctx context.Context) {
 		} else if ctx.Err() == nil {
 			s.log.Warn().Err(err).Msg("census failed")
 		}
+		s.limits.prune(s.now())
 		select {
 		case <-ctx.Done():
 			return
@@ -248,51 +265,92 @@ func (s *Server) view(ctx context.Context, op string, fn func(store.ReadTx) erro
 	return err
 }
 
+// route is one endpoint: who may call it, and what a call spends of a
+// scoped principal's limits.
+type route struct {
+	pattern string
+	auth    func(*http.Request) (principal, error)
+	h       func(*http.Request, principal) (any, error)
+	spends  spend
+}
+
+// spend is what a call takes from a scoped principal's limits.
+type spend int
+
+const (
+	// aWrite takes a token from the write bucket and a call slot.
+	aWrite spend = iota
+	// aCall takes a call slot alone.
+	aCall
+	// nothing passes untouched, so a limit never costs a lease.
+	nothing
+)
+
+// routes lists every endpoint. An admin route serves the operator and every
+// admin token, and its handler bounds what the token may name; an operator
+// route serves the operator alone.
+func (s *Server) routes() []route {
+	operator, admin, host, relay := s.authOperator, s.authAdmin, s.authHost, s.authRelay
+	return []route{
+		{"POST /v1/networks", operator, s.createNetwork, aWrite},
+		{"GET /v1/networks", admin, s.listNetworks, aCall},
+		{"GET /v1/networks/{net}", admin, s.getNetwork, aCall},
+		{"DELETE /v1/networks/{net}", operator, s.deleteNetwork, aWrite},
+		{"GET /v1/networks/{net}/quota", admin, s.getQuota, aCall},
+		{"PUT /v1/networks/{net}/quota", operator, s.setQuota, aWrite},
+		{"POST /v1/networks/{net}/services", admin, s.createService, aWrite},
+		{"GET /v1/networks/{net}/services", admin, s.listServices, aCall},
+		{"DELETE /v1/networks/{net}/services/{svc}", admin, s.deleteService, aWrite},
+		{"POST /v1/networks/{net}/rules", admin, s.createRule, aWrite},
+		{"GET /v1/networks/{net}/rules", admin, s.listRules, aCall},
+		{"DELETE /v1/networks/{net}/rules/{rule}", admin, s.deleteRule, aWrite},
+		{"GET /v1/networks/{net}/policy", admin, s.policy, aCall},
+		{"GET /v1/networks/{net}/interfaces", admin, s.listInterfaces, aCall},
+		{"POST /v1/interfaces/{id}/revoke", admin, s.revoke, aWrite},
+		{"POST /v1/networks/{net}/devices", admin, s.createDevice, aWrite},
+		{"POST /v1/hosts", admin, s.createHost, aWrite},
+		{"GET /v1/hosts", admin, s.listHosts, aCall},
+		{"PUT /v1/hosts/{host}/scope", admin, s.setHostScope, aWrite},
+		{"DELETE /v1/hosts/{host}", admin, s.deleteHost, aWrite},
+		{"POST /v1/relays", operator, s.createRelay, aWrite},
+		{"GET /v1/relays", operator, s.listRelays, aCall},
+		{"DELETE /v1/relays/{relay}", operator, s.deleteRelay, aWrite},
+		{"POST /v1/admins", operator, s.createAdmin, aWrite},
+		{"GET /v1/admins", operator, s.listAdmins, aCall},
+		{"PUT /v1/admins/{admin}/scope", operator, s.setAdminScope, aWrite},
+		{"DELETE /v1/admins/{admin}", operator, s.deleteAdmin, aWrite},
+
+		{"POST /v1/agent/attach", host, s.attach, aWrite},
+		{"POST /v1/agent/release", host, s.release, aWrite},
+		{"POST /v1/agent/renew", host, s.renew, nothing},
+		{"GET /v1/agent/state", host, s.hostPoll, aCall},
+
+		{"GET /v1/relay/state", relay, s.relayPoll, aCall},
+	}
+}
+
 // Handler returns the API's routes.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-	route := func(pattern string, auth func(*http.Request) (principal, error), h func(*http.Request, principal) (any, error)) {
-		name := pattern
-		mux.HandleFunc(pattern, func(w http.ResponseWriter, r *http.Request) {
+	for _, rt := range s.routes() {
+		mux.HandleFunc(rt.pattern, func(w http.ResponseWriter, r *http.Request) {
 			start := time.Now()
-			p, err := auth(r)
+			p, err := rt.auth(r)
 			var out any
+			if err == nil && p.scoped && rt.spends != nothing {
+				var done func()
+				if done, err = s.limits.admit(p, rt.spends == aWrite, s.now()); err == nil {
+					defer done()
+				}
+			}
 			if err == nil {
-				out, err = h(r, p)
+				out, err = rt.h(r, p)
 			}
 			code := s.respond(w, r, out, err)
-			s.m.requests.WithLabelValues(name, strconv.Itoa(code)).Inc()
-			s.m.latency.WithLabelValues(name).Observe(time.Since(start).Seconds())
+			s.m.requests.WithLabelValues(rt.pattern, strconv.Itoa(code)).Inc()
+			s.m.latency.WithLabelValues(rt.pattern).Observe(time.Since(start).Seconds())
 		})
 	}
-	admin, host, relay := s.authAdmin, s.authHost, s.authRelay
-
-	route("POST /v1/networks", admin, s.createNetwork)
-	route("GET /v1/networks", admin, s.listNetworks)
-	route("GET /v1/networks/{net}", admin, s.getNetwork)
-	route("DELETE /v1/networks/{net}", admin, s.deleteNetwork)
-	route("POST /v1/networks/{net}/services", admin, s.createService)
-	route("GET /v1/networks/{net}/services", admin, s.listServices)
-	route("DELETE /v1/networks/{net}/services/{svc}", admin, s.deleteService)
-	route("POST /v1/networks/{net}/rules", admin, s.createRule)
-	route("GET /v1/networks/{net}/rules", admin, s.listRules)
-	route("DELETE /v1/networks/{net}/rules/{rule}", admin, s.deleteRule)
-	route("GET /v1/networks/{net}/policy", admin, s.policy)
-	route("GET /v1/networks/{net}/interfaces", admin, s.listInterfaces)
-	route("POST /v1/interfaces/{id}/revoke", admin, s.revoke)
-	route("POST /v1/networks/{net}/devices", admin, s.createDevice)
-	route("POST /v1/hosts", admin, s.createHost)
-	route("DELETE /v1/hosts/{host}", admin, s.deleteHost)
-	route("POST /v1/relays", admin, s.createRelay)
-	route("GET /v1/relays", admin, s.listRelays)
-	route("DELETE /v1/relays/{relay}", admin, s.deleteRelay)
-
-	route("POST /v1/agent/attach", host, s.attach)
-	route("POST /v1/agent/release", host, s.release)
-	route("POST /v1/agent/renew", host, s.renew)
-	route("GET /v1/agent/state", host, s.hostPoll)
-
-	route("GET /v1/relay/state", relay, s.relayPoll)
 	return mux
 }
 
@@ -320,6 +378,9 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 func (s *Server) respond(w http.ResponseWriter, r *http.Request, out any, err error) int {
 	w.Header().Set("Content-Type", "application/json")
 	if err != nil {
+		if l, ok := errors.AsType[*errLimited](err); ok {
+			w.Header().Set("Retry-After", l.retryAfter())
+		}
 		code, body := errorBody(err)
 		if code >= 500 {
 			s.log.Error().Err(err).Str("route", r.Pattern).Msg("request failed")
@@ -336,6 +397,9 @@ func (s *Server) respond(w http.ResponseWriter, r *http.Request, out any, err er
 }
 
 func errorBody(err error) (int, *api.Error) {
+	if l, ok := errors.AsType[*errLimited](err); ok {
+		return http.StatusTooManyRequests, l.apiError()
+	}
 	var ae *api.Error
 	switch {
 	case errors.Is(err, errUnauthorized):
@@ -390,11 +454,58 @@ var errUnauthorized = errors.New("bad or missing bearer token")
 // up. A caller retries it.
 var errCannotAuthenticate = &api.Error{Code: api.CodeUnavailable, Message: "the control plane cannot check tokens now"}
 
+// errOperatorOnly answers an admin token calling a route that takes the
+// operator's.
+var errOperatorOnly = &api.Error{Code: api.CodeForbidden, Message: "this call takes the operator's token"}
+
+// authAdmin admits the operator's token and every admin token. What an
+// admin token may name, its handler reads in the transaction that acts.
 func (s *Server) authAdmin(r *http.Request) (principal, error) {
-	if subtle.ConstantTimeCompare([]byte(bearer(r)), []byte(s.cfg.AdminToken)) != 1 {
-		return principal{}, errUnauthorized
+	if subtle.ConstantTimeCompare([]byte(bearer(r)), []byte(s.cfg.AdminToken)) == 1 {
+		return principal{operator: true}, nil
 	}
-	return principal{}, nil
+	p, err := s.lookup(r, func(tx store.ReadTx, h [32]byte) (principal, error) {
+		a, err := tx.AdminByToken(h)
+		return principal{admin: a.ID, scoped: true}, err
+	})
+	if err == nil && p.admin == "" {
+		err = errUnauthorized
+	}
+	return p, err
+}
+
+// authOperator admits the operator's token alone.
+func (s *Server) authOperator(r *http.Request) (principal, error) {
+	p, err := s.authAdmin(r)
+	if err == nil && !p.operator {
+		err = errOperatorOnly
+	}
+	return p, err
+}
+
+// scopeOf reads what an admin may manage, inside the transaction that acts
+// on it, so a re-scoped or deleted admin token holds on every replica at
+// once and a network renamed between a check and its action cannot slip
+// past.
+func scopeOf(tx store.ReadTx, p principal) (store.Scope, error) {
+	if p.operator {
+		return cp.Global(), nil
+	}
+	a, err := tx.Admin(p.admin)
+	if errors.Is(err, store.ErrNotFound) {
+		return store.Scope{}, errUnauthorized
+	}
+	return a.Scope, err
+}
+
+// network resolves a call's network for p. One outside p's scope reads as
+// absent.
+func network(tx store.ReadTx, p principal, ref string) (store.Network, error) {
+	by, err := scopeOf(tx, p)
+	if err != nil {
+		return store.Network{}, err
+	}
+	return cp.ResolveNetworkIn(tx, by, ref)
 }
 
 // lookup resolves a bearer token to its host or relay, and trusts what it
@@ -429,7 +540,7 @@ func (s *Server) lookup(r *http.Request, find func(store.ReadTx, [32]byte) (prin
 func (s *Server) authHost(r *http.Request) (principal, error) {
 	p, err := s.lookup(r, func(tx store.ReadTx, h [32]byte) (principal, error) {
 		host, err := tx.HostByToken(h)
-		return principal{host: host.ID}, err
+		return principal{host: host.ID, scoped: !host.Scope.Global}, err
 	})
 	if err == nil && p.host == "" {
 		err = errUnauthorized

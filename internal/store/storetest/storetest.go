@@ -62,6 +62,7 @@ var cases = []struct {
 	{"DormantEdges", testDormantEdges},
 	{"Hosts", testHosts},
 	{"Relays", testRelays},
+	{"Admins", testAdmins},
 	{"Released4", testReleased4},
 	{"ReleasedPorts", testReleasedPorts},
 	{"PortCursor", testPortCursor},
@@ -188,6 +189,7 @@ func fullNetwork(id model.NetworkID, name string) store.Network {
 		Relays:  []model.RelayID{"relay-b", "relay-a"},
 		Next6:   math.MaxUint64, Next4: 1<<63 + 7, Revision: 1<<63 + 1,
 		Created: fine, Changed: fine.Add(time.Hour),
+		Quota: api.Quota{Interfaces: 1000, Services: 50, Rules: 200, Edges: math.MaxInt32},
 	}
 }
 
@@ -243,12 +245,23 @@ func bareEdge(net model.NetworkID, a, b model.InterfaceID) store.Edge {
 func fullHost(id model.HostID, name string) store.Host {
 	return store.Host{
 		ID: id, Name: name, TokenHash: key(7), Endpoint: netip.MustParseAddrPort("[2001:db8::7]:51820"),
-		Revision: 1<<63 + 3, Created: fine,
+		Revision: 1<<63 + 3, Created: fine, Scope: store.Scope{Networks: []model.NetworkID{"net-b", "net-a"}},
 	}
 }
 
 func bareHost(id model.HostID, name string) store.Host {
 	return store.Host{ID: id, Name: name, TokenHash: key(8), Created: t0}
+}
+
+func fullAdmin(id model.AdminID, name string) store.Admin {
+	return store.Admin{
+		ID: id, Name: name, TokenHash: key(13), Created: fine,
+		Scope: store.Scope{Networks: []model.NetworkID{"net-b", "net-a"}},
+	}
+}
+
+func bareAdmin(id model.AdminID, name string) store.Admin {
+	return store.Admin{ID: id, Name: name, TokenHash: key(14), Created: t0}
 }
 
 func fullRelay(id model.RelayID, name string) store.Relay {
@@ -572,8 +585,11 @@ func testDormantEdges(t *testing.T, s store.Store) {
 
 func testHosts(t *testing.T, s store.Store) {
 	full, bare := fullHost("host-full", "full"), bareHost("host-bare", "bare")
-	put(t, s, putHost, full, bare)
-	for _, want := range []store.Host{full, bare} {
+	global := bareHost("host-global", "global")
+	global.TokenHash, global.Scope = key(15), store.Scope{Global: true}
+	put(t, s, putHost, full, bare, global)
+	same(t, "Hosts", read(t, s, store.ReadTx.Hosts), []store.Host{bare, full, global})
+	for _, want := range []store.Host{full, bare, global} {
 		same(t, "Host", read(t, s, func(tx store.ReadTx) (store.Host, error) { return tx.Host(want.ID) }), want)
 		same(t, "HostByName", read(t, s, func(tx store.ReadTx) (store.Host, error) { return tx.HostByName(want.Name) }), want)
 		same(t, "HostByToken", read(t, s, func(tx store.ReadTx) (store.Host, error) { return tx.HostByToken(want.TokenHash) }), want)
@@ -591,6 +607,34 @@ func testHosts(t *testing.T, s store.Store) {
 	missing(t, s, "deleted HostByName", func(tx store.ReadTx) (store.Host, error) { return tx.HostByName("renamed") })
 	missing(t, s, "deleted HostByToken", func(tx store.ReadTx) (store.Host, error) { return tx.HostByToken(key(11)) })
 	same(t, "the other Host", read(t, s, func(tx store.ReadTx) (store.Host, error) { return tx.HostByToken(bare.TokenHash) }), bare)
+	same(t, "Hosts after a delete", read(t, s, store.ReadTx.Hosts), []store.Host{bare, global})
+}
+
+func putAdmin(tx store.Tx, a store.Admin) error { return tx.PutAdmin(a) }
+
+func testAdmins(t *testing.T, s store.Store) {
+	full, bare := fullAdmin("admin-full", "full"), bareAdmin("admin-bare", "bare")
+	put(t, s, putAdmin, full, bare)
+	for _, want := range []store.Admin{full, bare} {
+		same(t, "Admin", read(t, s, func(tx store.ReadTx) (store.Admin, error) { return tx.Admin(want.ID) }), want)
+		same(t, "AdminByName", read(t, s, func(tx store.ReadTx) (store.Admin, error) { return tx.AdminByName(want.Name) }), want)
+		same(t, "AdminByToken", read(t, s, func(tx store.ReadTx) (store.Admin, error) { return tx.AdminByToken(want.TokenHash) }), want)
+	}
+	same(t, "Admins", read(t, s, store.ReadTx.Admins), []store.Admin{bare, full})
+	missing(t, s, "Admin", func(tx store.ReadTx) (store.Admin, error) { return tx.Admin("admin-none") })
+	missing(t, s, "AdminByName", func(tx store.ReadTx) (store.Admin, error) { return tx.AdminByName("none") })
+	missing(t, s, "AdminByToken", func(tx store.ReadTx) (store.Admin, error) { return tx.AdminByToken(key(99)) })
+	full.Name, full.TokenHash, full.Scope.Networks = "renamed", key(16), full.Scope.Networks[1:]
+	put(t, s, putAdmin, full)
+	same(t, "replaced Admin", read(t, s, func(tx store.ReadTx) (store.Admin, error) { return tx.AdminByToken(key(16)) }), full)
+	missing(t, s, "AdminByToken of the old token", func(tx store.ReadTx) (store.Admin, error) { return tx.AdminByToken(key(13)) })
+	missing(t, s, "AdminByName of the old name", func(tx store.ReadTx) (store.Admin, error) { return tx.AdminByName("full") })
+	update(t, s, func(tx store.Tx) error {
+		return errors.Join(tx.DeleteAdmin("admin-full"), tx.DeleteAdmin("admin-none"))
+	})
+	missing(t, s, "deleted Admin", func(tx store.ReadTx) (store.Admin, error) { return tx.Admin("admin-full") })
+	missing(t, s, "deleted AdminByToken", func(tx store.ReadTx) (store.Admin, error) { return tx.AdminByToken(key(16)) })
+	same(t, "Admins after a delete", read(t, s, store.ReadTx.Admins), []store.Admin{bare})
 }
 
 func testRelays(t *testing.T, s store.Store) {
@@ -792,6 +836,11 @@ func testUniqueNames(t *testing.T, s store.Store) {
 	missing(t, s, "the conflicting relay", func(tx store.ReadTx) (store.Relay, error) { return tx.Relay("relay-2") })
 	put(t, s, putRelay, fullRelay("relay-1", "r"))
 
+	put(t, s, putAdmin, bareAdmin("admin-1", "a"))
+	conflicts(t, s, "a second admin named a", func(tx store.Tx) error { return tx.PutAdmin(bareAdmin("admin-2", "a")) })
+	missing(t, s, "the conflicting admin", func(tx store.ReadTx) (store.Admin, error) { return tx.Admin("admin-2") })
+	put(t, s, putAdmin, fullAdmin("admin-1", "a"))
+
 	put(t, s, putService, bareService("svc-1", "net-1", "web"))
 	conflicts(t, s, "a second service named web in net-1", func(tx store.Tx) error {
 		return tx.PutService(bareService("svc-2", "net-1", "web"))
@@ -865,12 +914,18 @@ func testConflictLeavesTransactionUsable(t *testing.T, s store.Store) {
 // checks that the store holds what was written.
 func testRecordsAreCopies(t *testing.T, s store.Store) {
 	n, r, e := fullNetwork("net-a", "a"), fullRelay("relay-a", "a"), fullEdge("net-a", "if-a", "if-b")
+	h, a := fullHost("host-a", "a"), fullAdmin("admin-a", "a")
 	written := struct {
-		relays []model.RelayID
-		addrs  []api.RelayAddress
-		ports  []store.EdgePorts
-	}{n.Relays, r.Addresses, e.Ports}
-	want := []any{fullNetwork("net-a", "a"), fullRelay("relay-a", "a"), fullEdge("net-a", "if-a", "if-b")}
+		relays    []model.RelayID
+		addrs     []api.RelayAddress
+		ports     []store.EdgePorts
+		hostNets  []model.NetworkID
+		adminNets []model.NetworkID
+	}{n.Relays, r.Addresses, e.Ports, h.Scope.Networks, a.Scope.Networks}
+	want := []any{
+		fullNetwork("net-a", "a"), fullRelay("relay-a", "a"), fullEdge("net-a", "if-a", "if-b"),
+		fullHost("host-a", "a"), fullAdmin("admin-a", "a"),
+	}
 	stored := func(tx store.ReadTx) ([]any, error) {
 		n, err := tx.Network("net-a")
 		if err != nil {
@@ -884,17 +939,28 @@ func testRecordsAreCopies(t *testing.T, s store.Store) {
 		if err != nil || len(es) != 1 {
 			return nil, fmt.Errorf("edges %v: %w", es, err)
 		}
-		return []any{n, r, es[0]}, nil
+		h, err := tx.Host("host-a")
+		if err != nil {
+			return nil, err
+		}
+		a, err := tx.Admin("admin-a")
+		if err != nil {
+			return nil, err
+		}
+		return []any{n, r, es[0], h, a}, nil
 	}
 	scribble := func(rs []any) {
 		rs[0].(store.Network).Relays[0] = "relay-scribbled"
 		rs[1].(store.Relay).Addresses[0].Local = addr("192.0.2.1")
 		rs[2].(store.Edge).Ports[0].AB = 1
+		rs[3].(store.Host).Scope.Networks[0] = "net-scribbled"
+		rs[4].(store.Admin).Scope.Networks[0] = "net-scribbled"
 	}
 	update(t, s, func(tx store.Tx) error {
-		return errors.Join(tx.PutNetwork(n), tx.PutRelay(r), tx.PutEdge(e))
+		return errors.Join(tx.PutNetwork(n), tx.PutRelay(r), tx.PutEdge(e), tx.PutHost(h), tx.PutAdmin(a))
 	})
 	written.relays[0], written.addrs[0].Local, written.ports[0].AB = "relay-scribbled", addr("192.0.2.1"), 1
+	written.hostNets[0], written.adminNets[0] = "net-scribbled", "net-scribbled"
 	same(t, "records after changing what was written", read(t, s, stored), want)
 	scribble(read(t, s, stored))
 	same(t, "records after changing what was read", read(t, s, stored), want)
@@ -933,6 +999,7 @@ func testUpdateReadsItsOwnWrites(t *testing.T, s store.Store) {
 	i.Network, i.Host = "net-a", "host-a"
 	r := store.Rule{ID: "rule-a", Network: "net-a", From: "svc-a", Proto: model.AnyProto, Created: t0}
 	e, h, rl := fullEdge("net-a", "if-a", "if-b"), fullHost("host-a", "h"), fullRelay("relay-a", "r")
+	ad := fullAdmin("admin-a", "ad")
 	q4 := store.Released4{Network: "net-a", Addr: addr("10.20.0.9"), At: at(1)}
 	qp := store.ReleasedPort{Relay: "relay-a", Addr: addr("10.0.0.9"), Port: 30000, At: at(1)}
 	check := func(tx store.ReadTx) error {
@@ -942,7 +1009,8 @@ func testUpdateReadsItsOwnWrites(t *testing.T, s store.Store) {
 			must(tx.Interface("if-a")), must(tx.Interfaces("net-a")), must(tx.HostInterfaces("host-a")),
 			must(tx.Rule("rule-a")), must(tx.Rules("net-a")),
 			must(tx.Edges("net-a")), must(tx.RelayEdges("relay-a")),
-			must(tx.Host("host-a")), must(tx.HostByName("h")), must(tx.HostByToken(h.TokenHash)),
+			must(tx.Host("host-a")), must(tx.HostByName("h")), must(tx.HostByToken(h.TokenHash)), must(tx.Hosts()),
+			must(tx.Admin("admin-a")), must(tx.AdminByName("ad")), must(tx.AdminByToken(ad.TokenHash)), must(tx.Admins()),
 			must(tx.Relay("relay-a")), must(tx.RelayByName("r")), must(tx.RelayByToken(rl.TokenHash)), must(tx.Relays()),
 			must(tx.Released4("net-a", at(2), 10)), must(tx.ReleasedPorts("relay-a", addr("10.0.0.9"), at(2), 10)),
 			must(tx.PortCursor("relay-a", addr("10.0.0.9"))),
@@ -953,7 +1021,8 @@ func testUpdateReadsItsOwnWrites(t *testing.T, s store.Store) {
 			i, []store.Interface{i}, []store.Interface{i},
 			r, []store.Rule{r},
 			[]store.Edge{e}, []store.Edge{e},
-			h, h, h,
+			h, h, h, []store.Host{h},
+			ad, ad, ad, []store.Admin{ad},
 			rl, rl, rl, []store.Relay{rl},
 			[]store.Released4{q4}, []store.ReleasedPort{qp},
 			uint16(30001),
@@ -970,7 +1039,7 @@ func testUpdateReadsItsOwnWrites(t *testing.T, s store.Store) {
 	update(t, s, func(tx store.Tx) error {
 		if err := errors.Join(
 			tx.DeleteNetwork("net-old"), tx.PutNetwork(n), tx.PutService(v), tx.PutInterface(i), tx.PutRule(r),
-			tx.PutEdge(e), tx.PutHost(h), tx.PutRelay(rl), tx.PutReleased4(q4), tx.PutReleasedPort(qp),
+			tx.PutEdge(e), tx.PutHost(h), tx.PutAdmin(ad), tx.PutRelay(rl), tx.PutReleased4(q4), tx.PutReleasedPort(qp),
 			tx.SetPortCursor("relay-a", addr("10.0.0.9"), 30001), tx.SetMeta("k", "v"),
 		); err != nil {
 			return err

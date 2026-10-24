@@ -36,6 +36,32 @@ func TestAnUpdateOlderThanAnAttachKeepsItsNetwork(t *testing.T) {
 	}
 }
 
+// TestALateAttachAnswerLeavesADroppedNetworkDropped covers an attach answer
+// delayed past a poll that dropped its network, as a rescope does: the
+// poll's generation passed the answer's revision, so the answer predates
+// the drop.
+func TestALateAttachAnswerLeavesADroppedNetworkDropped(t *testing.T) {
+	h := NewHostState()
+	if err := h.Apply(StateUpdate{Generation: 10, Present: []NetworkRef{{Network: "net-a", Revision: 10}},
+		Networks: []NetworkState{{Network: "net-a", Revision: 10}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Apply(StateUpdate{Generation: 11, Present: []NetworkRef{}}); err != nil {
+		t.Fatal(err)
+	}
+	h.Merge(NetworkState{Network: "net-a", Revision: 10})
+	h.Merge(NetworkState{Network: "net-b", Revision: 11})
+	if len(h.Networks) != 0 {
+		t.Fatalf("late attach answers brought back %v", h.NetworkIDs())
+	}
+	// An answer past the generation comes from an attach the poll
+	// predates.
+	h.Merge(NetworkState{Network: "net-a", Revision: 12})
+	if n, ok := h.Networks["net-a"]; !ok || n.Revision != 12 {
+		t.Fatalf("an attach answer newer than the poll was dropped: %v", h.NetworkIDs())
+	}
+}
+
 func TestAnUpdateMustCarryWhatItLists(t *testing.T) {
 	h := NewHostState()
 	err := h.Apply(StateUpdate{Generation: 5, Present: []NetworkRef{{Network: model.NetworkID("net-a"), Revision: 5}}})

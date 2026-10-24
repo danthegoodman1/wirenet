@@ -39,6 +39,13 @@ const (
 	dnsGo        = "internal/dns/dns.go"
 	memStore     = "internal/store/mem/mem.go"
 	pgQueries    = "internal/store/pgstore/db/interfaces.sql.go"
+	pgScopes     = "internal/store/pgstore/schema/0007_scopes.sql"
+	storeGo      = "internal/store/store.go"
+	cpScope      = "internal/cp/scope.go"
+	cpState      = "internal/cp/state.go"
+	cpHandlers   = "internal/cpserver/handlers.go"
+	cpclientGo   = "internal/cpclient/client.go"
+	cpLimits     = "internal/cpserver/limits.go"
 )
 
 // Code that more than one edit moves or matches.
@@ -270,7 +277,7 @@ var Mutants = []Mutant{
 		ID:     "ipv4-quarantine-from-release",
 		Breaks: "an IPv4 address waits out its quarantine from its holder's drain, so a late drain never frees an address peers still route",
 		Edits: []Edit{
-			{cpPlane, "\t\ti.State, i.Ended = api.Released, now\n\t\tif err := p.end(tx, now, i, false); err != nil {", "\t\ti.State, i.Ended = api.Released, now\n\t\tif err := p.end(tx, now, i, true); err != nil {"},
+			{cpPlane, "\t\ti.State, i.Ended = api.Released, now\n\t\tif _, err := p.end(tx, now, i, false); err != nil {", "\t\ti.State, i.Ended = api.Released, now\n\t\tif _, err := p.end(tx, now, i, true); err != nil {"},
 			{cpPlane, "\t\tif i.Addr4.IsValid() {\n\t\t\tif err := tx.PutReleased4(store.Released4{Network: i.Network, Addr: i.Addr4, At: now}); err != nil {\n\t\t\t\treturn 0, err\n\t\t\t}\n\t\t}\n", ""},
 		},
 		Catch: []string{"cp"},
@@ -285,8 +292,8 @@ var Mutants = []Mutant{
 		ID:     "ipv6-reuse",
 		Breaks: "an IPv6 address is never reused",
 		Edits: []Edit{{cpPlane,
-			"\tn, err := tx.Network(i.Network)\n\tif err != nil {\n\t\treturn err\n\t}\n\tif i.Drained {",
-			"\tn, err := tx.Network(i.Network)\n\tif err != nil {\n\t\treturn err\n\t}\n\tif n.Next6 > first6 && addrAt(n.Prefix6, n.Next6-1) == i.Addr6 {\n\t\tn.Next6--\n\t}\n\tif i.Drained {"}},
+			"\tn, err := tx.Network(i.Network)\n\tif err != nil {\n\t\treturn holdings{}, err\n\t}\n\tvar held holdings\n",
+			"\tn, err := tx.Network(i.Network)\n\tif err != nil {\n\t\treturn holdings{}, err\n\t}\n\tif n.Next6 > first6 && addrAt(n.Prefix6, n.Next6-1) == i.Addr6 {\n\t\tn.Next6--\n\t}\n\tvar held holdings\n"}},
 		Catch: []string{"cp", "sim"},
 	},
 	{
@@ -1096,13 +1103,13 @@ var Mutants = []Mutant{
 	{
 		ID:     "replace-leaves-holder-live",
 		Breaks: "a replacing attach revokes the member's holder in its own transaction",
-		Edits:  []Edit{{cpPlane, "if err := p.Revoke(tx, now, holder.ID); err != nil {", "if err := error(nil); err != nil {"}},
+		Edits:  []Edit{{cpPlane, "gone, err := p.revoke(tx, now, holder.ID)", "gone, err := holdings{}, error(nil)"}},
 		Catch:  []string{"cp", "e2e"},
 	},
 	{
 		ID:     "replace-drains-holder",
 		Breaks: "a replaced holder is revoked, so it reaches no peer once hosts converge, rather than draining",
-		Edits:  []Edit{{cpPlane, "if err := p.Revoke(tx, now, holder.ID); err != nil {", "if err := p.Release(tx, now, holder.Host, []model.InterfaceID{holder.ID}); err != nil {"}},
+		Edits:  []Edit{{cpPlane, "gone, err := p.revoke(tx, now, holder.ID)", "gone, err := holdings{}, p.Release(tx, now, holder.Host, []model.InterfaceID{holder.ID})"}},
 		Catch:  []string{"cp", "e2e"},
 	},
 	{
@@ -1284,5 +1291,305 @@ var Mutants = []Mutant{
 		Breaks: "the release order is total, so the older of an edge's two initiations goes however many batches one release holds",
 		Edits:  []Edit{{relayCore, "\tcase az && bz:\n\t\treturn 0\n\tcase az:\n\t\treturn 1\n\tcase bz:\n\t\treturn -1\n", "\tcase az || bz:\n\t\treturn 0\n"}},
 		Catch:  []string{"relay-core"},
+	},
+	{
+		ID:     "host-scope-unchecked",
+		Breaks: "a host attaches only into the networks its scope admits",
+		Edits:  []Edit{{cpPlane, "n, err := ResolveNetworkIn(tx, h.Scope, req.Network)", "n, err := ResolveNetworkIn(tx, Global(), req.Network); _ = h"}},
+		Catch:  []string{"cp", "sim", "e2e"},
+	},
+	{
+		ID:     "emptied-scope-admits-all",
+		Breaks: "a scope listing no network admits none, so one emptied by its networks' deletion never reads as global",
+		Edits:  []Edit{{storeGo, "return s.Global || slices.Contains(s.Networks, n)", "return s.Global || len(s.Networks) == 0 || slices.Contains(s.Networks, n)"}},
+		Catch:  []string{"cp", "sim"},
+	},
+	{
+		ID:     "rescope-keeps-interfaces",
+		Breaks: "rescoping a host revokes its interfaces in every network the change removes",
+		Edits:  []Edit{{cpScope, "if compile.Connected(i) && compile.Built(i) && !sc.Admits(i.Network) {", "if false && compile.Connected(i) && compile.Built(i) && !sc.Admits(i.Network) {"}},
+		Catch:  []string{"cp", "sim", "e2e"},
+	},
+	{
+		ID:     "poll-outside-scope",
+		Breaks: "a host's poll carries only the networks its scope admits, so a lost network's retained records show it nothing that network gains",
+		Edits:  []Edit{{cpState, "if compile.Built(i) && h.Scope.Admits(i.Network) {", "if compile.Built(i) {"}},
+		Catch:  []string{"cp", "sim"},
+	},
+	{
+		ID:     "rescope-unbumped",
+		Breaks: "a rescope moves its host's generation, so the host's agent drops a lost network even when nothing in it was revoked",
+		Edits:  []Edit{{cpScope, "\tif err := bumpHosts(tx, []model.HostID{h.ID}); err != nil {\n\t\treturn store.Host{}, nil, err\n\t}\n\th, err = tx.Host(h.ID)", "\th, err = tx.Host(h.ID)"}},
+		Catch:  []string{"cp"},
+	},
+	{
+		ID:     "rescope-regained-unbumped",
+		Breaks: "a rescope moves every network it gives back to a host that holds records there, so the host's next poll carries that network's state",
+		Edits:  []Edit{{cpScope, "if compile.Built(i) && sc.Admits(i.Network) && !h.Scope.Admits(i.Network) {", "if false {"}},
+		Catch:  []string{"cp", "sim"},
+	},
+	{
+		ID:     "attach-answers-ended",
+		Breaks: "an attach answer read after a rescope ended its interface carries nothing of the network the host lost",
+		Edits:  []Edit{{cpState, "if i.State != api.Live {\n\t\treturn api.NetworkState{}, apiErr(api.CodeConflict,", "if false {\n\t\treturn api.NetworkState{}, apiErr(api.CodeConflict,"}},
+		Catch:  []string{"cp"},
+	},
+	{
+		ID:     "attach-answers-other-host",
+		Breaks: "an attach answer reads only its own host's interface, so an identifier another host took since shows nothing of that host's network",
+		Edits:  []Edit{{cpState, "if err == nil && i.Host != host {", "if false {"}},
+		Catch:  []string{"cp"},
+	},
+	{
+		ID:     "late-attach-answer-merged",
+		Breaks: "an attach answer that arrives after a poll dropped its network leaves the network dropped",
+		Edits:  []Edit{{apiState, "if ok && held.Revision > n.Revision || !ok && n.Revision <= h.Generation {", "if ok && held.Revision > n.Revision {"}},
+		Catch:  []string{"api"},
+	},
+	{
+		ID:     "rescope-keeps-gateways",
+		Breaks: "rescoping a host revokes its gateways too, which ends the development machines behind them",
+		Edits:  []Edit{{cpScope, "if compile.Connected(i) && compile.Built(i) && !sc.Admits(i.Network) {", "if compile.Connected(i) && i.Kind == api.Workload && !sc.Admits(i.Network) {"}},
+		Catch:  []string{"cp"},
+	},
+	{
+		ID:     "empty-scope-host-managed",
+		Breaks: "a host that admits nothing answers to the global admin alone, since every scope holds an empty one",
+		Edits:  []Edit{{cpScope, "return by.Global || !sc.Global && len(sc.Networks) > 0 && sc.Within(by)", "return by.Global || !sc.Global && sc.Within(by)"}},
+		Catch:  []string{"cp"},
+	},
+	{
+		ID:     "scoped-admin-creates-global-host",
+		Breaks: "only the global admin registers a global host or widens one to every network",
+		Edits:  []Edit{{cpScope, "\t\tif !by.Global {\n\t\t\treturn store.Scope{}, apiErr(api.CodeForbidden, \"only the global admin gives a host every network\")", "\t\tif false {\n\t\t\treturn store.Scope{}, apiErr(api.CodeForbidden, \"only the global admin gives a host every network\")"}},
+		Catch:  []string{"cp", "e2e"},
+	},
+	{
+		ID:     "scoped-admin-host-without-network",
+		Breaks: "a scoped admin's hosts name at least one of its networks, so none leaves its management",
+		Edits:  []Edit{{cpScope, "if len(req.Networks) == 0 && !by.Global {", "if false {"}},
+		Catch:  []string{"cp"},
+	},
+	{
+		ID:     "scoped-admin-deletes-foreign-host",
+		Breaks: "a scoped admin deletes only hosts within its scope",
+		Edits:  []Edit{{cpPlane, "h, err := ResolveHostIn(tx, by, ref)", "h, err := ResolveHost(tx, ref)"}},
+		Catch:  []string{"cp", "cpserver"},
+	},
+	{
+		ID:     "hosts-list-unfiltered",
+		Breaks: "a scoped admin lists only the hosts it manages",
+		Edits:  []Edit{{cpScope, "return slices.DeleteFunc(hosts, func(h store.Host) bool { return !Manages(by, h.Scope) }), err", "return hosts, err"}},
+		Catch:  []string{"cp", "cpserver"},
+	},
+	{
+		ID:     "out-of-scope-forbidden",
+		Breaks: "a network outside a principal's scope answers not_found, as a missing one does, so a tenant learns nothing of another's names",
+		Edits:  []Edit{{cpScope, "\t\treturn store.Network{}, notFound(store.ErrNotFound, \"network \"+ref)", "\t\treturn store.Network{}, apiErr(api.CodeForbidden, \"network %s is outside the scope\", ref)"}},
+		Catch:  []string{"cp", "cpserver"},
+	},
+	{
+		ID:     "admin-token-without-network",
+		Breaks: "an admin token manages at least one network",
+		Edits:  []Edit{{cpScope, "\tif len(refs) == 0 {\n\t\treturn store.Scope{}, apiErr(api.CodeInvalid, \"an admin token manages at least one network\")", "\tif false {\n\t\treturn store.Scope{}, apiErr(api.CodeInvalid, \"an admin token manages at least one network\")"}},
+		Catch:  []string{"cp"},
+	},
+	{
+		ID:     "rescope-keeps-draining",
+		Breaks: "rescoping a host revokes its interfaces still draining on their peers, not only its live ones",
+		Edits:  []Edit{{cpScope, "if compile.Connected(i) && compile.Built(i) && !sc.Admits(i.Network) {", "if i.State == api.Live && compile.Built(i) && !sc.Admits(i.Network) {"}},
+		Catch:  []string{"cp", "sim"},
+	},
+	{
+		ID:     "service-skips-scope",
+		Breaks: "creating a service checks its network against the caller's scope in the transaction that acts",
+		Edits:  []Edit{{cpPlane, "(store.Service, error) {\n\tn, err := ResolveNetworkIn(tx, by, netRef)", "(store.Service, error) {\n\tn, err := ResolveNetworkIn(tx, Global(), netRef); _ = by"}},
+		Catch:  []string{"cpserver", "e2e"},
+	},
+	{
+		ID:     "rule-skips-scope",
+		Breaks: "creating a rule checks its network against the caller's scope",
+		Edits:  []Edit{{cpPlane, "(store.Rule, error) {\n\tn, err := ResolveNetworkIn(tx, by, netRef)", "(store.Rule, error) {\n\tn, err := ResolveNetworkIn(tx, Global(), netRef)"}},
+		Catch:  []string{"cpserver"},
+	},
+	{
+		ID:     "device-skips-scope",
+		Breaks: "creating a development machine checks its network against the caller's scope",
+		Edits:  []Edit{{cpPlane, "(store.Interface, error) {\n\tn, err := ResolveNetworkIn(tx, by, netRef)", "(store.Interface, error) {\n\tn, err := ResolveNetworkIn(tx, Global(), netRef); _ = by"}},
+		Catch:  []string{"cpserver"},
+	},
+	{
+		ID:     "device-gateway-elsewhere",
+		Breaks: "a gateway of another network reads as absent, so a device request tells nothing of another tenant's interfaces",
+		Edits:  []Edit{{cpPlane, "if err == nil && gw.Network != n.ID {", "if false {"}},
+		Catch:  []string{"cp"},
+	},
+	{
+		ID:     "deny-deletion-unbounded",
+		Breaks: "deleting a deny that would connect pairs past the edge bound fails, as any change past a bound does",
+		Edits:  []Edit{{cpPlane, "\t\tif err := overQuota(\"edges\", n.Quota.Edges, h.edgesBefore, h.edgesAfter); err != nil {\n\t\t\treturn err\n", "\t\tif err := overQuota(\"edges\", n.Quota.Edges, h.edgesAfter, h.edgesAfter); err != nil {\n\t\t\treturn err\n"}},
+		Catch:  []string{"cp"},
+	},
+	{
+		ID:     "read-skips-scope",
+		Breaks: "a read naming a network checks it against the admin token's scope",
+		Edits:  []Edit{{cpServer, "return cp.ResolveNetworkIn(tx, by, ref)", "by.Global = true\n\treturn cp.ResolveNetworkIn(tx, by, ref)"}},
+		Catch:  []string{"cpserver", "e2e"},
+	},
+	{
+		ID:     "revoke-skips-scope",
+		Breaks: "an admin token revokes only interfaces of its networks",
+		Edits:  []Edit{{cpScope, "if err == nil && !by.Admits(i.Network) {", "if err == nil && !by.Admits(i.Network) && false {"}},
+		Catch:  []string{"cpserver"},
+	},
+	{
+		ID:     "networks-list-unfiltered",
+		Breaks: "an admin token lists only its networks",
+		Edits:  []Edit{{cpHandlers, "\t\t\tif by.Admits(n.ID) {\n\t\t\t\tout = append(out, networkInfo(n))", "\t\t\tif by.Admits(n.ID) || true {\n\t\t\t\tout = append(out, networkInfo(n))"}},
+		Catch:  []string{"cpserver", "e2e"},
+	},
+	{
+		ID:     "scoped-admin-grants-egress",
+		Breaks: "only the operator grants internet egress, whose traffic leaves from the operator's addresses",
+		Edits:  []Edit{{cpPlane, "if req.To == api.Internet && req.Action != api.Deny && !by.Global {", "if false {"}},
+		Catch:  []string{"cp", "cpserver"},
+	},
+	{
+		ID:     "operator-route-admits-admin",
+		Breaks: "an operator route refuses admin tokens",
+		Edits:  []Edit{{cpServer, "\tif err == nil && !p.operator {\n\t\terr = errOperatorOnly", "\tif false {\n\t\terr = errOperatorOnly"}},
+		Catch:  []string{"cpserver", "e2e"},
+	},
+	{
+		ID:     "deleted-admin-reads-global",
+		Breaks: "an admin token whose record is gone is refused at once, whatever a replica cached",
+		Edits:  []Edit{{cpServer, "\tif errors.Is(err, store.ErrNotFound) {\n\t\treturn store.Scope{}, errUnauthorized\n\t}\n\treturn a.Scope, err", "\tif errors.Is(err, store.ErrNotFound) {\n\t\treturn cp.Global(), nil\n\t}\n\treturn a.Scope, err"}},
+		Catch:  []string{"cpserver"},
+	},
+	{
+		ID:     "quota-interfaces-unchecked",
+		Breaks: "an attach past a network's interface quota fails and changes nothing",
+		Edits:  []Edit{{cpPlane, "\t\tif err := overQuota(\"live interfaces\", n.Quota.Interfaces, held.live-1, held.live); err != nil {\n\t\t\treturn store.Interface{}, \"\", err", "\t\tif err := overQuota(\"live interfaces\", n.Quota.Interfaces, held.live, held.live); err != nil {\n\t\t\treturn store.Interface{}, \"\", err"}},
+		Catch:  []string{"cp", "e2e"},
+	},
+	{
+		ID:     "quota-edges-unchecked",
+		Breaks: "an attach past a network's edge quota fails, so one tenant's policy cannot spend the relay ports every network shares",
+		Edits:  []Edit{{cpPlane, "overQuota(\"edges\", n.Quota.Edges, edgesFrom, held.edgesAfter)", "overQuota(\"edges\", n.Quota.Edges, held.edgesAfter, held.edgesAfter)"}},
+		Catch:  []string{"cp"},
+	},
+	{
+		ID:     "quota-rules-unchecked",
+		Breaks: "a rule past a network's rule quota fails",
+		Edits:  []Edit{{cpPlane, "overQuota(\"rules\", n.Quota.Rules, len(rules), len(rules)+1)", "overQuota(\"rules\", n.Quota.Rules, len(rules)+1, len(rules)+1)"}},
+		Catch:  []string{"cp", "e2e"},
+	},
+	{
+		ID:     "quota-services-unchecked",
+		Breaks: "a service past a network's service quota fails",
+		Edits:  []Edit{{cpPlane, "if n.Quota.Services > 0 {", "if false {"}},
+		Catch:  []string{"cp"},
+	},
+	{
+		ID:     "quota-blocks-standing",
+		Breaks: "a bound lowered below what a network holds stops growth only, so a change that adds nothing passes",
+		Edits:  []Edit{{cpScope, "if bound > 0 && after > bound && after > before {", "if bound > 0 && after > bound {"}},
+		Catch:  []string{"cp"},
+	},
+	{
+		ID:     "limits-unapplied",
+		Breaks: "a scoped principal's calls spend its limits",
+		Edits:  []Edit{{cpServer, "if err == nil && p.scoped && rt.spends != nothing {", "if false {"}},
+		Catch:  []string{"cpserver"},
+	},
+	{
+		ID:     "scoped-host-unlimited",
+		Breaks: "a host whose scope is not global counts as scoped for its limits",
+		Edits:  []Edit{{cpServer, "return principal{host: host.ID, scoped: !host.Scope.Global}, err", "return principal{host: host.ID}, err"}},
+		Catch:  []string{"cpserver"},
+	},
+	{
+		ID:     "renewal-limited",
+		Breaks: "a renewal spends no write, so a limit never costs a lease",
+		Edits:  []Edit{{cpServer, "{\"POST /v1/agent/renew\", host, s.renew, nothing},", "{\"POST /v1/agent/renew\", host, s.renew, aWrite},"}},
+		Catch:  []string{"cpserver"},
+	},
+	{
+		ID:     "renewal-takes-a-slot",
+		Breaks: "a renewal takes none of the calls a scoped host may have running, so a full cap never costs a lease",
+		Edits:  []Edit{{cpServer, "{\"POST /v1/agent/renew\", host, s.renew, nothing},", "{\"POST /v1/agent/renew\", host, s.renew, aCall},"}},
+		Catch:  []string{"cpserver"},
+	},
+	{
+		ID:     "prune-drops-running",
+		Breaks: "pruning keeps a bucket while a call runs, so its release finds the count it took",
+		Edits:  []Edit{{cpLimits, "if b.inFlight == 0 && full {", "if full {"}},
+		Catch:  []string{"cpserver"},
+	},
+	{
+		ID:     "bucket-clock-runs-back",
+		Breaks: "a call clocked before the bucket's last refills nothing and leaves the bucket's time",
+		Edits:  []Edit{{cpLimits, "if d := now.Sub(b.at); d > 0 {", "if d := now.Sub(b.at); true {"}},
+		Catch:  []string{"cpserver"},
+	},
+	{
+		ID:     "retry-after-ignored",
+		Breaks: "the client waits out a limited answer within its call's timeout",
+		Edits:  []Edit{{cpclientGo, "\t\t\treturn &limited{wait: wait, err: &ae}", "\t\t\t_ = wait\n\t\t\treturn &ae"}},
+		Catch:  []string{"cpserver"},
+	},
+	{
+		ID:     "limited-aborts-agent",
+		Breaks: "a limited call the client cannot wait out answers unavailable, which an agent retries rather than aborting the attach",
+		Edits:  []Edit{{cpclientGo, "&api.Error{Code: api.CodeUnavailable, Message: \"limited: \" + l.err.Message}", "l.err"}},
+		Catch:  []string{"cpserver"},
+	},
+	{
+		ID:     "pg-host-scope-dropped",
+		Breaks: "Postgres keeps a host's scope as it was put",
+		Edits:  []Edit{{pgTx, "Global: h.Scope.Global, Networks: networks,", "Global: true, Networks: networks,"}},
+		Catch:  []string{"pgstore"},
+	},
+	{
+		ID:     "mem-host-scope-aliased",
+		Breaks: "the memory store copies a host's scope, so a caller changing what it read changes nothing stored",
+		Edits:  []Edit{{memStore, "func cloneHost(h store.Host) store.Host          { h.Scope.Networks = slices.Clone(h.Scope.Networks); return h }", "func cloneHost(h store.Host) store.Host          { return h }"}},
+		Catch:  []string{"store"},
+	},
+	{
+		ID:     "migration-scopes-earlier-hosts",
+		Breaks: "hosts registered before scopes stay global",
+		Edits:  []Edit{{pgScopes, "ALTER TABLE hosts ADD COLUMN global boolean NOT NULL DEFAULT true;", "ALTER TABLE hosts ADD COLUMN global boolean NOT NULL DEFAULT false;"}},
+		Catch:  []string{"pgstore"},
+	},
+	{
+		ID:     "egress-deny-lifted",
+		Breaks: "a scoped caller may narrow internet egress and never widen it, so it cannot delete a deny to the internet",
+		Edits:  []Edit{{cpPlane, "if r.To == \"\" && r.Deny && !by.Global {", "if false {"}},
+		Catch:  []string{"cp"},
+	},
+	{
+		ID:     "scoped-egress-deny-refused",
+		Breaks: "a scoped caller may write a deny to the internet, which narrows what the operator granted",
+		Edits:  []Edit{{cpPlane, "if req.To == api.Internet && req.Action != api.Deny && !by.Global {", "if req.To == api.Internet && !by.Global {"}},
+		Catch:  []string{"cp"},
+	},
+	{
+		ID:     "deleted-network-kept-in-scopes",
+		Breaks: "a deleted network leaves every host's and admin's scope, so no scope keeps an identifier nothing can name again",
+		Edits:  []Edit{{cpPlane, "\tif err := dropFromScopes(tx, n.ID); err != nil {\n\t\treturn err\n\t}\n", ""}},
+		Catch:  []string{"cp"},
+	},
+	{
+		ID:     "creation-drops-defaults",
+		Breaks: "a network's creation gives each bound it leaves out the control plane's default",
+		Edits:  []Edit{{cpPlane, "quota := mergeQuota(req.Quota, p.Config.Quota)", "quota := req.Quota"}},
+		Catch:  []string{"cp"},
+	},
+	{
+		ID:     "replacement-counts-from-revoked",
+		Breaks: "a replacement's edges count from before its holder's revocation, so one that leaves the count where it was passes a lowered bound",
+		Edits:  []Edit{{cpPlane, "edgesFrom, replaced = gone.edgesBefore, holder.ID", "edgesFrom, replaced = -1+0*gone.edgesBefore, holder.ID"}},
+		Catch:  []string{"cp"},
 	},
 }

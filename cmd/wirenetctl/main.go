@@ -1,16 +1,20 @@
-// Command wirenetctl drives the control plane's operator API and a host
+// Command wirenetctl drives the control plane's admin API and a host
 // agent's local API.
 //
-//	wirenetctl network create NAME [--prefix6 P] [--prefix4 P] [--mtu N] [--relays R1,R2]
+//	wirenetctl network create NAME [--prefix6 P] [--prefix4 P] [--mtu N] [--relays R1,R2] [QUOTA]
 //	wirenetctl network list | get NET | delete NET
+//	wirenetctl quota show NET | set NET [QUOTA]
 //	wirenetctl service create NET NAME [--ipv4] [--mode flip|cutover]
 //	wirenetctl service list NET | delete NET SVC
 //	wirenetctl rule create NET FROM TO [--deny] [--proto tcp|udp|any] [--ports 80 | 8000-8100]
 //	wirenetctl rule list NET | delete NET RULE
 //	wirenetctl policy NET               (the flows the rules leave open)
 //	wirenetctl interface list NET | revoke IFACE
-//	wirenetctl host create NAME [--endpoint ADDR:PORT]
-//	wirenetctl host delete HOST         (revokes its interfaces)
+//	wirenetctl host create NAME [--endpoint ADDR:PORT] [--network NET]...
+//	wirenetctl host list | delete HOST  (delete revokes its interfaces)
+//	wirenetctl host scope HOST --network NET... | --global
+//	wirenetctl admin create NAME --network NET...
+//	wirenetctl admin list | delete ADMIN | scope ADMIN --network NET...
 //	wirenetctl relay create NAME --address LOCAL[=ADVERTISED] [--address ...] --ports LO-HI --probe-port N
 //	wirenetctl relay list | delete RELAY
 //	wirenetctl device create NET SVC --gateway IFACE [--ttl 24h] [--out FILE]
@@ -21,12 +25,24 @@
 // A rule's FROM or TO may be '*', every service but the one on the other
 // side, and TO may be internet.
 //
+// QUOTA is any of --interfaces N, --services N, --rules N and --edges N,
+// each bounding what the network holds. A network's creation gives each
+// bound it leaves out the control plane's default; quota set replaces the
+// whole quota, a bound left out unbounded.
+//
+// A host created with --network may attach only into those networks; one
+// without is global. Rescoping a host revokes its interfaces in the networks
+// it loses. An admin token manages only the networks it names: their
+// services, rules, interfaces and development machines, and hosts scoped
+// within them.
+//
 // An attach with --member holds that name among the service's members, so
 // M.SVC.NET.internal resolves to the workload's own address; --replace
 // revokes the name's current holder.
 //
-// The control plane is $WIRENET_CP, authenticated by $WIRENET_ADMIN_TOKEN; the
-// agent's socket is $WIRENET_AGENT_SOCKET.
+// The control plane is $WIRENET_CP, authenticated by $WIRENET_ADMIN_TOKEN,
+// the operator's token or an admin token; the agent's socket is
+// $WIRENET_AGENT_SOCKET.
 package main
 
 import (
@@ -56,7 +72,7 @@ func main() {
 }
 
 func usage() error {
-	return errors.New("usage: wirenetctl network|service|rule|policy|interface|host|relay|attach|detach|interfaces|status ...; see the package documentation")
+	return errors.New("usage: wirenetctl network|quota|service|rule|policy|interface|host|admin|relay|attach|detach|interfaces|status ...; see the package documentation")
 }
 
 func run(args []string) error {
@@ -90,11 +106,12 @@ func run(args []string) error {
 		p4 := fs.String("prefix4", "", "IPv4 prefix for services that opt in")
 		mtu := fs.Int("mtu", 0, "overlay MTU")
 		relays := fs.String("relays", "", "relay names or identifiers, in preference order")
+		quota := quotaFlags(fs)
 		name, err := parse(fs, rest, 1)
 		if err != nil {
 			return err
 		}
-		req := api.CreateNetwork{Name: name[0], MTU: *mtu}
+		req := api.CreateNetwork{Name: name[0], MTU: *mtu, Quota: *quota}
 		if req.Prefix6, err = optPrefix(*p6); err != nil {
 			return err
 		}
@@ -121,6 +138,19 @@ func run(args []string) error {
 			return err
 		}
 		return c.DeleteNetwork(ctx, a[0])
+	case "quota show":
+		a, err := parse(fs, rest, 1)
+		if err != nil {
+			return err
+		}
+		return show(c.Quota(ctx, a[0]))
+	case "quota set":
+		quota := quotaFlags(fs)
+		a, err := parse(fs, rest, 1)
+		if err != nil {
+			return err
+		}
+		return show(c.SetQuota(ctx, a[0], *quota))
 	case "service create":
 		ipv4 := fs.Bool("ipv4", false, "give the service an IPv4 address too")
 		mode := fs.String("mode", "", "flip (default) or cutover")
@@ -186,23 +216,63 @@ func run(args []string) error {
 		return c.Revoke(ctx, model.InterfaceID(a[0]))
 	case "host create":
 		endpoint := fs.String("endpoint", "", "where development machines reach a gateway on this host")
+		var nets stringList
+		fs.Var(&nets, "network", "a network the host may attach into, repeatable; none makes it global")
 		a, err := parse(fs, rest, 1)
 		if err != nil {
 			return err
 		}
-		req := api.CreateHost{Name: a[0]}
+		req := api.CreateHost{Name: a[0], Networks: nets}
 		if *endpoint != "" {
 			if req.Endpoint, err = netip.ParseAddrPort(*endpoint); err != nil {
 				return err
 			}
 		}
 		return show(c.CreateHost(ctx, req))
+	case "host list":
+		return show(c.Hosts(ctx))
+	case "host scope":
+		var nets stringList
+		fs.Var(&nets, "network", "a network the host may attach into, repeatable")
+		global := fs.Bool("global", false, "let the host attach into every network")
+		a, err := parse(fs, rest, 1)
+		if err != nil {
+			return err
+		}
+		if *global == (len(nets) > 0) {
+			return errors.New("host scope: give --global or at least one --network")
+		}
+		return show(c.SetHostScope(ctx, a[0], api.Scope{Global: *global, Networks: nets}))
 	case "host delete":
 		a, err := parse(fs, rest, 1)
 		if err != nil {
 			return err
 		}
 		return c.DeleteHost(ctx, a[0])
+	case "admin create":
+		var nets stringList
+		fs.Var(&nets, "network", "a network the token manages, repeatable")
+		a, err := parse(fs, rest, 1)
+		if err != nil {
+			return err
+		}
+		return show(c.CreateAdmin(ctx, api.CreateAdmin{Name: a[0], Networks: nets}))
+	case "admin list":
+		return show(c.Admins(ctx))
+	case "admin scope":
+		var nets stringList
+		fs.Var(&nets, "network", "a network the token manages, repeatable")
+		a, err := parse(fs, rest, 1)
+		if err != nil {
+			return err
+		}
+		return show(c.SetAdminScope(ctx, a[0], nets))
+	case "admin delete":
+		a, err := parse(fs, rest, 1)
+		if err != nil {
+			return err
+		}
+		return c.DeleteAdmin(ctx, a[0])
 	case "relay create":
 		var addrs addrList
 		fs.Var(&addrs, "address", "LOCAL[=ADVERTISED], repeatable")
@@ -370,4 +440,24 @@ func (a *addrList) Set(s string) error {
 	}
 	*a = append(*a, ra)
 	return nil
+}
+
+// stringList is a repeatable flag.
+type stringList []string
+
+func (l *stringList) String() string { return strings.Join(*l, ",") }
+
+func (l *stringList) Set(s string) error {
+	*l = append(*l, s)
+	return nil
+}
+
+// quotaFlags registers a quota's bounds on fs.
+func quotaFlags(fs *flag.FlagSet) *api.Quota {
+	var q api.Quota
+	fs.IntVar(&q.Interfaces, "interfaces", 0, "the most live interfaces the network holds")
+	fs.IntVar(&q.Services, "services", 0, "the most services the network holds")
+	fs.IntVar(&q.Rules, "rules", 0, "the most rules the network holds")
+	fs.IntVar(&q.Edges, "edges", 0, "the most edges the network holds, each two ports on every relay of its set")
+	return &q
 }

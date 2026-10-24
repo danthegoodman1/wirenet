@@ -309,8 +309,14 @@ func (h *HostState) Apply(u StateUpdate) error {
 }
 
 // Merge takes one network's state outside a poll, as an attach delivers it.
+// A network held at a newer revision stays. So does the absence of one at
+// or below the generation held: the poll that delivered that generation
+// listed every network the host then had, so it had dropped this one, as
+// a rescope or the network's deletion does, and an attach answer that
+// arrived late must not bring it back.
 func (h *HostState) Merge(n NetworkState) {
-	if held, ok := h.Networks[n.Network]; ok && held.Revision > n.Revision {
+	held, ok := h.Networks[n.Network]
+	if ok && held.Revision > n.Revision || !ok && n.Revision <= h.Generation {
 		return
 	}
 	h.Networks[n.Network] = &n

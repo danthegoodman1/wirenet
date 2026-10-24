@@ -186,6 +186,31 @@ func (t *tx) HostByToken(hash [32]byte) (store.Host, error) {
 	return one(t, r, err, host)
 }
 
+func (t *tx) Hosts() ([]store.Host, error) {
+	rows, err := t.q.ListHosts(t.ctx)
+	return all(t, rows, err, host)
+}
+
+func (t *tx) Admin(id model.AdminID) (store.Admin, error) {
+	r, err := t.q.GetAdmin(t.ctx, string(id))
+	return one(t, r, err, admin)
+}
+
+func (t *tx) AdminByName(name string) (store.Admin, error) {
+	r, err := t.q.GetAdminByName(t.ctx, name)
+	return one(t, r, err, admin)
+}
+
+func (t *tx) AdminByToken(hash [32]byte) (store.Admin, error) {
+	r, err := t.q.GetAdminByToken(t.ctx, hash[:])
+	return one(t, r, err, admin)
+}
+
+func (t *tx) Admins() ([]store.Admin, error) {
+	rows, err := t.q.ListAdmins(t.ctx)
+	return all(t, rows, err, admin)
+}
+
 func (t *tx) Relay(id model.RelayID) (store.Relay, error) {
 	r, err := t.q.GetRelay(t.ctx, string(id))
 	return one(t, r, err, relay)
@@ -241,10 +266,14 @@ func (t *tx) PutNetwork(n store.Network) error {
 	if err != nil {
 		return err
 	}
+	quota, err := json.Marshal(n.Quota)
+	if err != nil {
+		return err
+	}
 	written, err := t.q.PutNetwork(t.ctx, db.PutNetworkParams{
 		ID: string(n.ID), Name: n.Name, Prefix6: n.Prefix6, Prefix4: n.Prefix4, Mtu: int64(n.MTU),
 		Relays: relays, Next6: int64(n.Next6), Next4: int64(n.Next4), Revision: int64(n.Revision),
-		Created: n.Created, Changed: n.Changed,
+		Created: n.Created, Changed: n.Changed, Quota: quota,
 	})
 	return t.unique(written, err, "network", n.Name)
 }
@@ -314,11 +343,51 @@ func (t *tx) PutHost(h store.Host) error {
 	if err != nil {
 		return err
 	}
+	networks, err := scopeNetworks(h.Scope)
+	if err != nil {
+		return err
+	}
 	written, err := t.q.PutHost(t.ctx, db.PutHostParams{
 		ID: string(h.ID), Name: h.Name, TokenHash: h.TokenHash[:], Endpoint: string(endpoint),
-		Revision: int64(h.Revision), Created: h.Created,
+		Revision: int64(h.Revision), Created: h.Created, Global: h.Scope.Global, Networks: networks,
 	})
 	return t.unique(written, err, "host", h.Name)
+}
+
+func (t *tx) PutAdmin(a store.Admin) error {
+	networks, err := scopeNetworks(a.Scope)
+	if err != nil {
+		return err
+	}
+	written, err := t.q.PutAdmin(t.ctx, db.PutAdminParams{
+		ID: string(a.ID), Name: a.Name, TokenHash: a.TokenHash[:], Global: a.Scope.Global,
+		Networks: networks, Created: a.Created,
+	})
+	return t.unique(written, err, "admin", a.Name)
+}
+
+func (t *tx) DeleteAdmin(id model.AdminID) error {
+	return t.check(t.q.DeleteAdmin(t.ctx, string(id)))
+}
+
+// scopeNetworks renders a scope's networks as a JSON array, never null.
+func scopeNetworks(s store.Scope) ([]byte, error) {
+	if s.Networks == nil {
+		return []byte("[]"), nil
+	}
+	return json.Marshal(s.Networks)
+}
+
+// scope reads a scope back, keeping a list that names nothing nil.
+func scope(global bool, networks []byte) (store.Scope, error) {
+	s := store.Scope{Global: global}
+	if err := json.Unmarshal(networks, &s.Networks); err != nil {
+		return store.Scope{}, err
+	}
+	if len(s.Networks) == 0 {
+		s.Networks = nil
+	}
+	return s, nil
 }
 
 func (t *tx) DeleteHost(id model.HostID) error {
@@ -429,6 +498,9 @@ func network(r db.Network) (store.Network, error) {
 	if err := json.Unmarshal(r.Relays, &n.Relays); err != nil {
 		return store.Network{}, fmt.Errorf("network %s relays: %w", r.ID, err)
 	}
+	if err := json.Unmarshal(r.Quota, &n.Quota); err != nil {
+		return store.Network{}, fmt.Errorf("network %s quota: %w", r.ID, err)
+	}
 	return n, nil
 }
 
@@ -495,7 +567,22 @@ func host(r db.Host) (store.Host, error) {
 	if err := h.Endpoint.UnmarshalText([]byte(r.Endpoint)); err != nil {
 		return store.Host{}, fmt.Errorf("host %s endpoint: %w", r.ID, err)
 	}
+	if h.Scope, err = scope(r.Global, r.Networks); err != nil {
+		return store.Host{}, fmt.Errorf("host %s scope: %w", r.ID, err)
+	}
 	return h, nil
+}
+
+func admin(r db.Admin) (store.Admin, error) {
+	hash, err := bytes32(r.TokenHash)
+	if err != nil {
+		return store.Admin{}, fmt.Errorf("admin %s token hash: %w", r.ID, err)
+	}
+	sc, err := scope(r.Global, r.Networks)
+	if err != nil {
+		return store.Admin{}, fmt.Errorf("admin %s scope: %w", r.ID, err)
+	}
+	return store.Admin{ID: model.AdminID(r.ID), Name: r.Name, TokenHash: hash, Scope: sc, Created: r.Created.UTC()}, nil
 }
 
 func relay(r db.Relay) (store.Relay, error) {

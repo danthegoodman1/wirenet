@@ -96,9 +96,45 @@ var ErrUnavailable = errors.New("control plane unavailable")
 // errDialTimeout is a TCP connect that got no answer in DialTimeout.
 var errDialTimeout = errors.New("connect timed out")
 
+// limited is an answer refusing a call over its principal's limit, before
+// the call acted, with how long the server asked the caller to wait.
+type limited struct {
+	wait time.Duration
+	err  *api.Error
+}
+
+func (l *limited) Error() string { return l.err.Error() }
+
+// unavailable reports a limited call as one the caller retries, as it does
+// a control plane briefly away.
+func (l *limited) unavailable() error {
+	return fmt.Errorf("%w: %w", ErrUnavailable, &api.Error{Code: api.CodeUnavailable, Message: "limited: " + l.err.Message})
+}
+
+// do makes a call, and makes it again after a limited answer's wait while
+// the call's own timeout allows. A wait it cannot afford answers
+// unavailable, which an agent retries as it does an outage.
 func (c *Client) do(ctx context.Context, method, path string, in, out any, timeout time.Duration) error {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	for {
+		err := c.attempt(ctx, method, path, in, out)
+		l, ok := errors.AsType[*limited](err)
+		if !ok {
+			return err
+		}
+		if dl, ok := ctx.Deadline(); ok && time.Until(dl) < l.wait {
+			return l.unavailable()
+		}
+		select {
+		case <-time.After(l.wait):
+		case <-ctx.Done():
+			return l.unavailable()
+		}
+	}
+}
+
+func (c *Client) attempt(ctx context.Context, method, path string, in, out any) error {
 	var b []byte
 	if in != nil {
 		var err error
@@ -143,6 +179,13 @@ func (c *Client) do(ctx context.Context, method, path string, in, out any, timeo
 		var ae api.Error
 		if json.Unmarshal(b, &ae) != nil || ae.Code == "" {
 			ae = api.Error{Code: "http", Message: fmt.Sprintf("%s %s: %s", method, path, resp.Status)}
+		}
+		if resp.StatusCode == http.StatusTooManyRequests {
+			wait := time.Second
+			if secs, err := strconv.Atoi(resp.Header.Get("Retry-After")); err == nil && secs > 0 {
+				wait = time.Duration(secs) * time.Second
+			}
+			return &limited{wait: wait, err: &ae}
 		}
 		// A failure on the server's side is worth retrying; the agent
 		// tells retryable answers by their code.
@@ -207,7 +250,7 @@ func call[T any](c *Client, ctx context.Context, method, path string, in any) (T
 
 func esc(s string) string { return url.PathEscape(s) }
 
-// The operator's API.
+// The admin API.
 
 func (c *Client) CreateNetwork(ctx context.Context, req api.CreateNetwork) (api.Network, error) {
 	return call[api.Network](c, ctx, "POST", "/v1/networks", req)
@@ -223,6 +266,16 @@ func (c *Client) Network(ctx context.Context, ref string) (api.Network, error) {
 
 func (c *Client) DeleteNetwork(ctx context.Context, ref string) error {
 	return c.do(ctx, "DELETE", "/v1/networks/"+esc(ref), nil, nil, c.timeout)
+}
+
+// Quota reads a network's quota and what it holds against it.
+func (c *Client) Quota(ctx context.Context, net string) (api.QuotaInfo, error) {
+	return call[api.QuotaInfo](c, ctx, "GET", "/v1/networks/"+esc(net)+"/quota", nil)
+}
+
+// SetQuota replaces a network's quota.
+func (c *Client) SetQuota(ctx context.Context, net string, q api.Quota) (api.Network, error) {
+	return call[api.Network](c, ctx, "PUT", "/v1/networks/"+esc(net)+"/quota", q)
 }
 
 func (c *Client) CreateService(ctx context.Context, net string, req api.CreateService) (api.ServiceInfo, error) {
@@ -272,6 +325,17 @@ func (c *Client) CreateHost(ctx context.Context, req api.CreateHost) (api.Creden
 	return call[api.Credentials](c, ctx, "POST", "/v1/hosts", req)
 }
 
+// Hosts lists the hosts the caller manages.
+func (c *Client) Hosts(ctx context.Context) ([]api.HostInfo, error) {
+	return call[[]api.HostInfo](c, ctx, "GET", "/v1/hosts", nil)
+}
+
+// SetHostScope changes the networks a host may attach into, revoking its
+// interfaces in the networks it loses.
+func (c *Client) SetHostScope(ctx context.Context, ref string, sc api.Scope) (api.HostInfo, error) {
+	return call[api.HostInfo](c, ctx, "PUT", "/v1/hosts/"+esc(ref)+"/scope", sc)
+}
+
 // DeleteHost revokes a host's interfaces and deletes the host, by name or
 // identifier.
 func (c *Client) DeleteHost(ctx context.Context, ref string) error {
@@ -289,6 +353,25 @@ func (c *Client) Relays(ctx context.Context) ([]api.RelayInfo, error) {
 // DeleteRelay deletes a relay no network names, by name or identifier.
 func (c *Client) DeleteRelay(ctx context.Context, ref string) error {
 	return c.do(ctx, "DELETE", "/v1/relays/"+esc(ref), nil, nil, c.timeout)
+}
+
+// CreateAdmin issues a token that manages the networks it names.
+func (c *Client) CreateAdmin(ctx context.Context, req api.CreateAdmin) (api.Credentials, error) {
+	return call[api.Credentials](c, ctx, "POST", "/v1/admins", req)
+}
+
+func (c *Client) Admins(ctx context.Context) ([]api.AdminInfo, error) {
+	return call[[]api.AdminInfo](c, ctx, "GET", "/v1/admins", nil)
+}
+
+// SetAdminScope changes the networks an admin token manages.
+func (c *Client) SetAdminScope(ctx context.Context, ref string, networks []string) (api.AdminInfo, error) {
+	return call[api.AdminInfo](c, ctx, "PUT", "/v1/admins/"+esc(ref)+"/scope", api.Scope{Networks: networks})
+}
+
+// DeleteAdmin deletes an admin token, by name or identifier.
+func (c *Client) DeleteAdmin(ctx context.Context, ref string) error {
+	return c.do(ctx, "DELETE", "/v1/admins/"+esc(ref), nil, nil, c.timeout)
 }
 
 // An agent's API.

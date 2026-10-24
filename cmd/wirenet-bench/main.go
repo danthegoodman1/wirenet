@@ -12,6 +12,7 @@
 //	wirenet-bench dial   --target ADDR:PORT [--netns NS,NS,...] [--want NAME] [--streak 1] [--until 10s]
 //	wirenet-bench lookup --name NAME --want ADDR | --unlike ADDR [--netns NS] [--until 10s]
 //	wirenet-bench cpu    [--duration 10s]
+//	wirenet-bench api    --cp URL --token T | --token-file F --network NET [--hidden NET] [--rounds 20 | --duration D] [--port 20000]
 //	wirenet-bench agent attach  --network NET --service SVC --name NAME [--rounds 1] [--dial ADDR:PORT] [--detach] [--member M [--replace]]
 //	wirenet-bench agent detach  --interface ID
 //	wirenet-bench agent churn   --network NET --service SVC --name PREFIX [--duration 10s] [--concurrency 4]
@@ -44,10 +45,10 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: wirenet-bench serve|stream|rr|dial|lookup|cpu|agent ...; see the package documentation")
+		return errors.New("usage: wirenet-bench serve|stream|rr|dial|lookup|cpu|api|agent ...; see the package documentation")
 	}
 	cmds := map[string]func([]string) error{
-		"serve": serve, "stream": stream, "rr": rr, "dial": dial, "lookup": lookup, "cpu": cpu, "agent": agent,
+		"serve": serve, "stream": stream, "rr": rr, "dial": dial, "lookup": lookup, "cpu": cpu, "api": api, "agent": agent,
 	}
 	cmd, ok := cmds[args[0]]
 	if !ok {

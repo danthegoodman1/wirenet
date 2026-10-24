@@ -63,6 +63,10 @@ type Env interface {
 	// Ctl runs wirenetctl: agent commands (attach, detach, interfaces,
 	// status) against n's agent, and the rest against the control plane.
 	Ctl(ctx context.Context, n Node, args ...string) ([]byte, error)
+	// OperatorAPI is how a command run on the control-plane node reaches
+	// the API as the operator: its URL there, and the wirenet-bench flags
+	// that give it the operator's token, which stays on that node.
+	OperatorAPI() (url string, tokenArgs []string)
 	// Bin is the path of one of the fleet's binaries on a node.
 	Bin(name string) string
 	// AgentSocket is the path of n's agent socket.

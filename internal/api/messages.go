@@ -25,6 +25,9 @@ const (
 	CodeExhausted   = "exhausted"
 	CodeForbidden   = "forbidden"
 	CodeUnavailable = "unavailable"
+	// CodeLimited refuses a call over its principal's rate or concurrency
+	// limit, before it acts; the answer's Retry-After says when to retry.
+	CodeLimited = "limited"
 )
 
 // Admin API.
@@ -39,6 +42,25 @@ type CreateNetwork struct {
 	MTU     int          `json:"mtu,omitempty"`
 	// Relays names the relay set, in preference order.
 	Relays []model.RelayID `json:"relays,omitempty"`
+	// Quota bounds what the network may hold; each bound it leaves unset
+	// takes the control plane's default.
+	Quota Quota `json:"quota,omitzero"`
+}
+
+// Quota bounds what a network holds: live interfaces, services, rules, and
+// edges, which hold relay ports every network on a relay shares. A zero
+// leaves its bound unset.
+type Quota struct {
+	Interfaces int `json:"interfaces,omitempty"`
+	Services   int `json:"services,omitempty"`
+	Rules      int `json:"rules,omitempty"`
+	Edges      int `json:"edges,omitempty"`
+}
+
+// QuotaInfo is a network's quota and what it holds against it.
+type QuotaInfo struct {
+	Quota Quota `json:"quota"`
+	Usage Quota `json:"usage"`
 }
 
 // Network describes a network.
@@ -53,6 +75,7 @@ type Network struct {
 	// Changed is when the revision was committed, which agents measure
 	// convergence from.
 	Changed time.Time `json:"changed"`
+	Quota   Quota     `json:"quota,omitzero"`
 }
 
 // CreateService declares a service.
@@ -146,6 +169,40 @@ type CreateHost struct {
 	Name string `json:"name"`
 	// Endpoint is where development machines reach a gateway on this host.
 	Endpoint netip.AddrPort `json:"endpoint,omitzero"`
+	// Networks scopes the host to these networks, by name or identifier.
+	// A host given none is global, which only the global admin may create.
+	Networks []string `json:"networks,omitempty"`
+}
+
+// Scope is the networks a token admits: every network, or those listed by
+// name or identifier. An answer lists identifiers.
+type Scope struct {
+	Global   bool     `json:"global,omitempty"`
+	Networks []string `json:"networks,omitempty"`
+}
+
+// HostInfo describes a host to an admin.
+type HostInfo struct {
+	ID       model.HostID   `json:"id"`
+	Name     string         `json:"name"`
+	Endpoint netip.AddrPort `json:"endpoint,omitzero"`
+	Scope    Scope          `json:"scope"`
+	Created  time.Time      `json:"created"`
+}
+
+// CreateAdmin issues a token that manages the networks it names, by name or
+// identifier, and returns it once.
+type CreateAdmin struct {
+	Name     string   `json:"name"`
+	Networks []string `json:"networks"`
+}
+
+// AdminInfo describes an admin token to the operator.
+type AdminInfo struct {
+	ID      model.AdminID `json:"id"`
+	Name    string        `json:"name"`
+	Scope   Scope         `json:"scope"`
+	Created time.Time     `json:"created"`
 }
 
 // Credentials carry a new principal's identity and bearer token.

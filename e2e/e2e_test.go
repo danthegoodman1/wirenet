@@ -1446,3 +1446,123 @@ func TestCoLocatedMembersThatDialEachOtherConnectAtOnce(t *testing.T) {
 		t.Logf("%s, %s: p50 %v, max %v over %d rounds", k[0], k[1], ds[len(ds)/2].Round(100*time.Microsecond), ds[len(ds)-1].Round(100*time.Microsecond), len(ds))
 	}
 }
+
+func apiCode(err error) string {
+	var ae *api.Error
+	if errors.As(err, &ae) {
+		return ae.Code
+	}
+	return ""
+}
+
+// TestAScopedHostAndAnAdminTokenStayInTheirNetworks hands a tenant an admin
+// token for shop beside bank, another tenant's network on the operator's
+// host. The tenant builds shop, registers a host of its own, and finds bank
+// absent; its host's attach into bank leaves nothing behind; a quota
+// refuses its growth; and taking shop out of its host's scope fences the
+// host's workload, in each family.
+func TestAScopedHostAndAnAdminTokenStayInTheirNetworks(t *testing.T) {
+	l := newLab(t, "e2es", fastClocks...)
+	ctx := context.Background()
+	relay := must(l.AddRelay(ctx, "r1"))
+	hv := must(l.AddHost(ctx, "hv"))
+	for i, net := range []string{"shop", "bank"} {
+		must(l.Admin.CreateNetwork(ctx, api.CreateNetwork{
+			Name: net, Prefix4: netip.MustParsePrefix(fmt.Sprintf("10.%d.0.0/16", 110+i)), Relays: []model.RelayID{relay.ID},
+		}))
+	}
+	tenant := must(l.Client(must(l.Admin.CreateAdmin(ctx, api.CreateAdmin{Name: "tenant", Networks: []string{"shop"}})).Token))
+	must(tenant.CreateService(ctx, "shop", api.CreateService{Name: "web", IPv4: true}))
+	db := must(tenant.CreateService(ctx, "shop", api.CreateService{Name: "db", IPv4: true}))
+	must(tenant.CreateRule(ctx, "shop", api.CreateRule{From: "web", To: "db", Proto: model.TCP, Ports: model.PortRange{Lo: 5432, Hi: 5432}}))
+	must(l.Admin.CreateService(ctx, "bank", api.CreateService{Name: "web", IPv4: true}))
+	bankDBSvc := must(l.Admin.CreateService(ctx, "bank", api.CreateService{Name: "db", IPv4: true}))
+	must(l.Admin.CreateRule(ctx, "bank", api.CreateRule{From: "web", To: "db", Proto: model.TCP, Ports: model.PortRange{Lo: 5432, Hi: 5432}}))
+
+	if nets := must(tenant.Networks(ctx)); len(nets) != 1 || nets[0].Name != "shop" {
+		t.Fatalf("the tenant lists %v", nets)
+	}
+	for what, err := range map[string]error{
+		"a service in bank": func() error { _, err := tenant.CreateService(ctx, "bank", api.CreateService{Name: "x"}); return err }(),
+		"bank's interfaces": func() error { _, err := tenant.Interfaces(ctx, "bank"); return err }(),
+		"a host scoped to it": func() error {
+			_, err := tenant.CreateHost(ctx, api.CreateHost{Name: "x", Networks: []string{"bank"}})
+			return err
+		}(),
+		"a global host": func() error { _, err := tenant.CreateHost(ctx, api.CreateHost{Name: "x"}); return err }(),
+	} {
+		if apiCode(err) != api.CodeNotFound && apiCode(err) != api.CodeForbidden {
+			t.Errorf("the tenant reached %s: %v", what, err)
+		}
+	}
+
+	th := must(l.AddHostAs(ctx, tenant, "th", []string{"shop"}))
+	shopDB := must(hv.Attach(ctx, "db-1", "shop", "db"))
+	bankDB := must(hv.Attach(ctx, "db-2", "bank", "db"))
+	for _, i := range []api.LocalInterface{shopDB, bankDB} {
+		for _, a := range []netip.Addr{i.Addr6, i.Addr4} {
+			must(lab.Serve(i.Namespace, netip.AddrPortFrom(a, 5432), "db"))
+		}
+	}
+	web := must(th.Attach(ctx, "web-1", "shop", "web"))
+	for _, addr := range []netip.Addr{db.Addr6, db.Addr4} {
+		if _, got, err := timeToReach(web.Namespace, netip.AddrPortFrom(addr, 5432), 20*time.Second); err != nil || got != "db" {
+			t.Fatalf("the tenant's web to its db at %v: %q %v", addr, got, err)
+		}
+	}
+
+	// An attach into bank leaves no namespace on the tenant's host and no
+	// interface in bank for bank's hosts to peer with.
+	namespaces, bankIfaces := th.Namespaces(), len(must(l.Admin.Interfaces(ctx, "bank")))
+	if _, err := th.Attach(ctx, "web-2", "bank", "web"); err == nil {
+		t.Fatal("the tenant's host attached into bank")
+	}
+	if got := th.Namespaces(); !slices.Equal(got, namespaces) {
+		t.Errorf("the refused attach left namespaces %v, had %v", got, namespaces)
+	}
+	if got := len(must(l.Admin.Interfaces(ctx, "bank"))); got != bankIfaces {
+		t.Errorf("bank holds %d interfaces after the refused attach, had %d", got, bankIfaces)
+	}
+	for _, addr := range []netip.Addr{bankDBSvc.Addr6, bankDBSvc.Addr4, bankDB.Addr6, bankDB.Addr4} {
+		mustNotReach(t, web.Namespace, netip.AddrPortFrom(addr, 5432), "bank's db from the tenant's web")
+	}
+
+	// A quota at what shop holds refuses another interface and another
+	// rule, and the tenant cannot raise it.
+	must(l.Admin.SetQuota(ctx, "shop", api.Quota{Interfaces: 2, Rules: 1}))
+	if _, err := th.Attach(ctx, "web-3", "shop", "web"); err == nil {
+		t.Error("an attach past shop's quota succeeded")
+	}
+	if _, err := tenant.CreateRule(ctx, "shop", api.CreateRule{From: "db", To: "web", Proto: model.TCP}); apiCode(err) != api.CodeExhausted {
+		t.Errorf("a rule past shop's quota: %v", err)
+	}
+	if _, err := tenant.SetQuota(ctx, "shop", api.Quota{}); apiCode(err) != api.CodeForbidden {
+		t.Errorf("the tenant raising its quota: %v", err)
+	}
+	q := must(tenant.Quota(ctx, "shop"))
+	if q.Usage.Interfaces != 2 || q.Usage.Rules != 1 {
+		t.Errorf("shop's usage reads %+v", q.Usage)
+	}
+
+	// Taking shop out of the host's scope revokes its workload, which
+	// shop's db then refuses in each family.
+	must(l.Admin.SetHostScope(ctx, "th", api.Scope{}))
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if _, err := lab.Dial(web.Namespace, netip.AddrPortFrom(shopDB.Addr6, 5432), time.Second); err != nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the rescoped host's workload still reaches shop's db")
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	for _, addr := range []netip.Addr{db.Addr6, db.Addr4, shopDB.Addr6, shopDB.Addr4} {
+		mustNotReach(t, web.Namespace, netip.AddrPortFrom(addr, 5432), "shop's db from a host scoped out of shop")
+	}
+	for _, i := range must(l.Admin.Interfaces(ctx, "shop")) {
+		if i.ID == web.Interface && i.State != api.Revoked {
+			t.Errorf("the rescoped host's interface is %s", i.State)
+		}
+	}
+}
